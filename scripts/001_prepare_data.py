@@ -52,23 +52,23 @@ def parse_args():
     # ── Interactive testing ───────────────────────────────────────────────────
     # Uncomment the block below and swap `return p.parse_args()` → `return args`
     # to run interactively without passing command-line flags.
-    args = argparse.Namespace(
-         anndata              = "/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/IBDR_prep/processed_data/anndata_ready-batch1_8-meta_format_2025-09-22-IBDverse_conf_gt0pt5-immune-baseline-nobadsamps.h5ad",
-         archetype_scores     = "/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/archetypal_analysis_from_mrvi/results/tables/sample_archetype_scores.txt.gz",
-         celltype_cluster_map = "/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/mrVI/results/tables/celltype_to_cluster_map-from_final_celltypes.txt.gz",
-         cluster_col          = "clustered_celltypes",
-         sample_col           = "pool_participant",
-         rawcelltype_col      = "Celltypist:IBDverse_eqtl:predicted_labels",
-         hvg_pct              = 0.20,
-         hvg_max              = 2000,
-         pseudobulk_agg       = "mean",
-         include_abundance    = "true",
-         abundance_type       = "global",
-         min_sample_pct       = 0.2
-    )
+    #args = argparse.Namespace(
+    #     anndata              = "/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/IBDR_prep/processed_data/anndata_ready-batch1_8-meta_format_2025-09-22-IBDverse_conf_gt0pt5-immune-baseline-nobadsamps.h5ad",
+    #     archetype_scores     = "/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/archetypal_analysis_from_mrvi/results/tables/sample_archetype_scores.txt.gz",
+    #     celltype_cluster_map = "/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/mrVI/results/tables/celltype_to_cluster_map-from_final_celltypes.txt.gz",
+    #     cluster_col          = "clustered_celltypes",
+    #     sample_col           = "pool_participant",
+    #     rawcelltype_col      = "Celltypist:IBDverse_eqtl:predicted_labels",
+    #     hvg_pct              = 0.20,
+    #     hvg_max              = 2000,
+    #     pseudobulk_agg       = "mean",
+    #     include_abundance    = "true",
+    #     abundance_type       = "global",
+    #     min_sample_pct       = 0.2
+    #)
     # ─────────────────────────────────────────────────────────────────────────
 
-    return args
+    return p.parse_args()
 
 
 def main():

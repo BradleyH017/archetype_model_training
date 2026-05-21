@@ -12,11 +12,12 @@ Outputs (in --outdir):
 import argparse
 import os
 import sys
+import xgboost as xgb
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.append("scripts")
 from helpers import (
     build_estimator,
     load_pseudobulk,
@@ -38,6 +39,26 @@ def parse_args():
     p.add_argument("--n_iter",        type=int, default=50)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--outdir",        required=True)
+
+    # ── Interactive testing ───────────────────────────────────────────────────
+    # Uncomment the block below and swap `return p.parse_args()` → `return args`
+    # to run interactively without passing command-line flags.
+    args = argparse.Namespace(
+         cluster  = "D",
+         pseudobulk = "temp/D.pseudobulk.npz",
+         targets = "temp/D.targets.csv",
+         xgb_params = "scripts/param_grids/xgboost_params.json",
+         rf_params = "scripts/param_grids/rf_params.json",
+         models = ["xgboost", "rf"],
+         n_outer_folds = 5,
+         n_inner_folds = 5,
+         n_iter = 50,
+         seed = 42,
+         outdir = "temp/D"
+    )
+    # ─────────────────────────────────────────────────────────────────────────
+
+
     return p.parse_args()
 
 

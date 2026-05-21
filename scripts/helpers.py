@@ -158,6 +158,8 @@ def get_archetype_weight_cols(df_scores, cluster_prefix):
 # ─── 3. Tree models ───────────────────────────────────────────────────────────
 
 def build_estimator(model_name, param_grid_path, seed):
+    import xgboost as xgb
+    import json as json
     """Instantiate a base estimator and load its hyperparameter grid from JSON."""
     with open(param_grid_path) as f:
         grid = json.load(f)

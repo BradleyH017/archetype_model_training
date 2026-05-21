@@ -16,6 +16,8 @@ Each cell cluster is treated independently. For each cluster the pipeline:
 
 Targets are the archetype simplex weights produced by the upstream archetypal analysis (MRVI).
 
+See [hyperparameters.md](hyperparameters.md) for full details of the hyperparameter search grids and optimisation strategy for each model.
+
 ---
 
 ## Directory structure
