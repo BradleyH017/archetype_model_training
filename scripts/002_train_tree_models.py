@@ -9,6 +9,9 @@ Outputs (in --outdir):
   {model}_feature_importances.csv  — mean importance across outer folds
   summary_metrics.csv              — per-archetype OOF R² / RMSE for all models
 """
+# TESTING: module load HGI/softpack/users/eh19/BioAUTOMATED/1
+# module load cuda-12.1.1
+# module load gcc-13.1.0
 import argparse
 import os
 import sys
@@ -28,36 +31,50 @@ from helpers import (
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--cluster",       required=True)
-    p.add_argument("--pseudobulk",    required=True)
-    p.add_argument("--targets",       required=True)
-    p.add_argument("--xgb_params",    required=True)
-    p.add_argument("--rf_params",     required=True)
-    p.add_argument("--models",        nargs="+", default=["xgboost", "rf"])
-    p.add_argument("--n_outer_folds", type=int, default=5)
-    p.add_argument("--n_inner_folds", type=int, default=5)
-    p.add_argument("--n_iter",        type=int, default=50)
-    p.add_argument("--seed",          type=int, default=42)
-    p.add_argument("--outdir",        required=True)
+    p.add_argument("--cluster",          required=True)
+    p.add_argument("--pseudobulk",       required=True)
+    p.add_argument("--targets",          required=True)
+    p.add_argument("--xgb_params",       required=True)
+    p.add_argument("--rf_params",        required=True)
+    p.add_argument("--models",           nargs="+", default=["xgboost", "rf"])
+    p.add_argument("--n_outer_folds",    type=int, default=5)
+    p.add_argument("--n_inner_folds",    type=int, default=5)
+    p.add_argument("--n_iter",           type=int, default=50)
+    p.add_argument("--seed",             type=int, default=42)
+    p.add_argument("--outdir",           required=True)
+    # Parallelism: n_jobs_outer runs outer folds in parallel (set = n_outer_folds for max);
+    #              n_jobs_inner parallelises RandomizedSearchCV iterations within a fold.
+    # Avoid oversubscription: if either > 1, leave estimator_n_jobs at the default of 1.
+    p.add_argument("--n_jobs_outer",     type=int, default=1,
+                   help="Parallel outer folds (1=sequential, -1=all cores, or n_outer_folds)")
+    p.add_argument("--n_jobs_inner",     type=int, default=1,
+                   help="n_jobs for RandomizedSearchCV inner HPO iterations")
+    p.add_argument("--estimator_n_jobs", type=int, default=None,
+                   help="n_jobs inside base estimator; auto=1 when outer/inner parallelism on")
+    p.add_argument("--device",           default="cpu", choices=["cpu", "cuda"],
+                   help="XGBoost device; 'cuda' uses gpu_hist (submit to a GPU node)")
 
     # ── Interactive testing ───────────────────────────────────────────────────
     # Uncomment the block below and swap `return p.parse_args()` → `return args`
     # to run interactively without passing command-line flags.
     args = argparse.Namespace(
-         cluster  = "D",
-         pseudobulk = "temp/D.pseudobulk.npz",
-         targets = "temp/D.targets.csv",
-         xgb_params = "scripts/param_grids/xgboost_params.json",
-         rf_params = "scripts/param_grids/rf_params.json",
-         models = ["xgboost", "rf"],
-         n_outer_folds = 5,
-         n_inner_folds = 5,
-         n_iter = 50,
-         seed = 42,
-         outdir = "temp/D"
+         cluster         = "D",
+         pseudobulk      = "temp/D.pseudobulk.npz",
+         targets         = "temp/D.targets.csv",
+         xgb_params      = "scripts/param_grids/xgboost_params_small.json",
+         rf_params       = "scripts/param_grids/rf_params.json",
+         models          = ["xgboost", "rf"],
+         n_outer_folds   = 5,
+         n_inner_folds   = 5,
+         n_iter          = 50,
+         seed            = 42,
+         outdir          = "temp/D",
+         n_jobs_outer    = 1,
+         n_jobs_inner    = 1,
+         estimator_n_jobs= 4,
+         device          = "cpu",
     )
     # ─────────────────────────────────────────────────────────────────────────
-
 
     return p.parse_args()
 
@@ -66,31 +83,42 @@ def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
+    # Auto-set estimator n_jobs: use 1 when outer/inner parallelism is active to
+    # avoid thread oversubscription; otherwise allow the estimator to use more cores.
+    estimator_n_jobs = args.estimator_n_jobs
+    if estimator_n_jobs is None:
+        estimator_n_jobs = 1 if (args.n_jobs_outer != 1 or args.n_jobs_inner != 1) else 4
+
     print(f"Loading pseudo-bulk from {args.pseudobulk}")
     X, samples, feature_names = load_pseudobulk(args.pseudobulk)
 
     print(f"Loading targets from {args.targets}")
-    df_tgt   = pd.read_csv(args.targets, index_col=0)
+    df_tgt = pd.read_csv(args.targets, index_col=0)
     keep_idx = [i for i, s in enumerate(samples) if s in df_tgt.index]
     if len(keep_idx) < len(samples):
         print(f"  Dropping {len(samples) - len(keep_idx)} samples not in targets")
-    X         = X[keep_idx]
-    samples   = [samples[i] for i in keep_idx]
-    y         = df_tgt.loc[samples].values.astype(float)
+    X = X[keep_idx]
+    samples = [samples[i] for i in keep_idx]
+    y = df_tgt.loc[samples].values.astype(float)
     arch_cols = df_tgt.columns.tolist()
-    print(f"  X={X.shape}  y={y.shape}")
+    print(f"X={X.shape}  y={y.shape}")
+    print(f"n_jobs_outer={args.n_jobs_outer}  n_jobs_inner={args.n_jobs_inner}"
+          f" estimator_n_jobs={estimator_n_jobs}  device={args.device}")
 
     all_metrics = []
 
     for model_name in args.models:
         print(f"\n{'='*40}\n{model_name.upper()}")
         param_path = args.xgb_params if model_name == "xgboost" else args.rf_params
-        base, grid = build_estimator(model_name, param_path, args.seed)
+        device = args.device if model_name == "xgboost" else "cpu"
+        base, grid = build_estimator(model_name, param_path, args.seed, n_jobs=estimator_n_jobs, device=device)
 
         fold_metrics, oof_preds, all_imps = run_nested_cv_tree(
             X, y, model_name, base, grid,
             args.n_outer_folds, args.n_inner_folds, args.n_iter,
             args.seed, feature_names,
+            n_jobs_outer=args.n_jobs_outer,
+            n_jobs_inner=args.n_jobs_inner,
         )
 
         all_metrics.extend(

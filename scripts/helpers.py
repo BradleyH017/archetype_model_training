@@ -22,6 +22,8 @@ import h5py
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from joblib import Parallel, delayed
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import KFold, RandomizedSearchCV
@@ -157,40 +159,100 @@ def get_archetype_weight_cols(df_scores, cluster_prefix):
 
 # ─── 3. Tree models ───────────────────────────────────────────────────────────
 
-def build_estimator(model_name, param_grid_path, seed):
+def build_estimator(model_name, param_grid_path, seed, n_jobs=1, device="cpu"):
     import xgboost as xgb
     import json as json
     """Instantiate a base estimator and load its hyperparameter grid from JSON."""
     with open(param_grid_path) as f:
         grid = json.load(f)
     if model_name == "xgboost":
-        base = xgb.XGBRegressor(
+        xgb_kwargs = dict(
             objective   = "reg:squarederror",
             tree_method = "hist",
             random_state= seed,
-            n_jobs      = 4,
+            n_jobs      = n_jobs,
             verbosity   = 0,
         )
+        if device == "cuda":
+            xgb_kwargs["tree_method"] = "gpu_hist"
+            # Verify this XGBoost build was compiled with GPU support
+            try:
+                _probe = xgb.XGBRegressor(tree_method="gpu_hist", n_estimators=1, verbosity=0)
+                _probe.fit(np.zeros((2, 2), dtype=np.float32), np.zeros(2, dtype=np.float32))
+                del _probe
+            except xgb.core.XGBoostError:
+                import sys
+                print(
+                    "WARNING: XGBoost was not compiled with GPU support in this environment; "
+                    "falling back to tree_method='hist' (CPU).",
+                    file=sys.stderr, flush=True,
+                )
+                xgb_kwargs["tree_method"] = "hist"
+        base = xgb.XGBRegressor(**xgb_kwargs)
     elif model_name == "rf":
-        base = RandomForestRegressor(random_state=seed, n_jobs=4)
+        base = RandomForestRegressor(random_state=seed, n_jobs=n_jobs)
     else:
         raise ValueError(f"Unknown model: {model_name}")
     return base, grid
 
 
+def _fit_outer_fold(fold_i, tr_idx, te_idx, X, y, estimator, search_grid,
+                    n_inner, n_iter, seed, n_jobs_inner, n_targets):
+    """Run one outer CV fold: inner HPO search + refit + predict. Used by run_nested_cv_tree."""
+    X_tr, X_te = X[tr_idx], X[te_idx]
+    y_tr, y_te = y[tr_idx], y[te_idx]
+
+    scaler   = StandardScaler()
+    X_tr_sc  = scaler.fit_transform(X_tr)
+    X_te_sc  = scaler.transform(X_te)
+
+    inner_cv = KFold(n_splits=n_inner, shuffle=True, random_state=seed + 1)
+    search   = RandomizedSearchCV(
+        clone(estimator),
+        search_grid,
+        n_iter      = n_iter,
+        cv          = inner_cv,
+        scoring     = "r2",
+        random_state= seed,
+        n_jobs      = n_jobs_inner,
+        refit       = True,
+        error_score = "raise",
+    )
+    search.fit(X_tr_sc, y_tr if n_targets > 1 else y_tr.ravel())
+    best = search.best_estimator_
+
+    y_pred = best.predict(X_te_sc)
+    if y_pred.ndim == 1:
+        y_pred = y_pred.reshape(-1, 1)
+
+    r2   = r2_score(y_te, y_pred, multioutput='uniform_average')
+    rmse = float(np.sqrt(mean_squared_error(y_te, y_pred)))
+    metrics = {"fold": fold_i, "r2_mean": r2, "rmse_mean": rmse,
+               "best_params": str(search.best_params_)}
+    print(f"    fold {fold_i+1}: R²={r2:.3f}  RMSE={rmse:.4f}", flush=True)
+
+    if hasattr(best, "estimators_"):
+        imp = np.mean([e.feature_importances_ for e in best.estimators_], axis=0)
+    elif hasattr(best, "feature_importances_"):
+        imp = best.feature_importances_
+    else:
+        imp = None
+
+    return fold_i, te_idx, y_pred, metrics, imp
+
+
 def run_nested_cv_tree(X, y, model_name, base, grid,
-                       n_outer, n_inner, n_iter, seed, feature_names):
+                       n_outer, n_inner, n_iter, seed, feature_names,
+                       n_jobs_outer=1, n_jobs_inner=1):
     """Nested CV for XGBoost / RF with RandomizedSearchCV inner loop.
 
+    n_jobs_outer : parallel outer folds (set to n_outer for max parallelism;
+                   use n_jobs_inner=1 and estimator n_jobs=1 to avoid oversubscription)
+    n_jobs_inner : n_jobs passed to RandomizedSearchCV for parallel HPO iterations
     Returns fold_metrics list, oof_preds (n_samples × n_targets), importances list.
     """
     outer_cv  = KFold(n_splits=n_outer, shuffle=True, random_state=seed)
-    inner_cv  = KFold(n_splits=n_inner, shuffle=True, random_state=seed + 1)
     n_targets = y.shape[1]
-
-    oof_preds    = np.full_like(y, np.nan, dtype=float)
-    fold_metrics = []
-    all_imps     = []
 
     # Wrap XGBoost in MultiOutputRegressor for multi-target consistency
     if n_targets > 1 and model_name == "xgboost":
@@ -200,49 +262,21 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
         estimator   = base
         search_grid = grid
 
-    for fold_i, (tr_idx, te_idx) in enumerate(outer_cv.split(X)):
-        X_tr, X_te = X[tr_idx], X[te_idx]
-        y_tr, y_te = y[tr_idx], y[te_idx]
-
-        scaler  = StandardScaler()
-        X_tr_sc = scaler.fit_transform(X_tr)
-        X_te_sc = scaler.transform(X_te)
-
-        search = RandomizedSearchCV(
-            estimator,
-            search_grid,
-            n_iter      = n_iter,
-            cv          = inner_cv,
-            scoring     = "r2",
-            random_state= seed,
-            n_jobs      = 1,
-            refit       = True,
-            error_score = "raise",
+    results = Parallel(n_jobs=n_jobs_outer)(
+        delayed(_fit_outer_fold)(
+            fold_i, tr_idx, te_idx, X, y, estimator, search_grid,
+            n_inner, n_iter, seed, n_jobs_inner, n_targets,
         )
-        search.fit(X_tr_sc, y_tr if n_targets > 1 else y_tr.ravel())
-        best = search.best_estimator_
+        for fold_i, (tr_idx, te_idx) in enumerate(outer_cv.split(X))
+    )
 
-        y_pred = best.predict(X_te_sc)
-        if y_pred.ndim == 1:
-            y_pred = y_pred.reshape(-1, 1)
+    oof_preds    = np.full_like(y, np.nan, dtype=float)
+    fold_metrics = []
+    all_imps     = []
+
+    for fold_i, te_idx, y_pred, metrics, imp in sorted(results, key=lambda r: r[0]):
         oof_preds[te_idx] = y_pred
-
-        r2   = r2_score(y_te, y_pred, multioutput='uniform_average')
-        rmse = float(np.sqrt(mean_squared_error(y_te, y_pred)))
-        fold_metrics.append({
-            "fold":        fold_i,
-            "r2_mean":     r2,
-            "rmse_mean":   rmse,
-            "best_params": str(search.best_params_),
-        })
-        print(f"    fold {fold_i+1}: R²={r2:.3f}  RMSE={rmse:.4f}")
-
-        if hasattr(best, "estimators_"):
-            imp = np.mean([e.feature_importances_ for e in best.estimators_], axis=0)
-        elif hasattr(best, "feature_importances_"):
-            imp = best.feature_importances_
-        else:
-            imp = None
+        fold_metrics.append(metrics)
         if imp is not None:
             all_imps.append(imp)
 

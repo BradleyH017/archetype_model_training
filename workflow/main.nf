@@ -25,6 +25,7 @@ process PREPARE_DATA {
         --cluster_col          "${params.cluster_col}" \\
         --sample_col           "${params.sample_col}" \\
         --celltype_col         "${params.celltype_col}" \\
+        --rawcelltype_col      "${params.rawcelltype_col}" \\
         --hvg_pct              ${params.hvg_pct} \\
         --hvg_max              ${params.hvg_max} \\
         --pseudobulk_agg       "${params.pseudobulk_agg}" \\
@@ -68,6 +69,8 @@ process TRAIN_TREE_MODELS {
         --n_inner_folds  ${params.n_inner_folds} \\
         --n_iter         ${params.n_hpo_iter_tree} \\
         --seed           ${params.random_seed} \\
+        --n_jobs_outer   ${params.n_jobs_outer ?: 1} \\
+        --n_jobs_inner   ${params.n_jobs_inner ?: 1} \\
         --outdir         ${cluster}_tree
     """
 }
