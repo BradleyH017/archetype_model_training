@@ -59,8 +59,8 @@ def parse_args():
     # to run interactively without passing command-line flags.
     args = argparse.Namespace(
          cluster         = "D",
-         pseudobulk      = "temp/D.pseudobulk.npz",
-         targets         = "temp/D.targets.csv",
+         pseudobulk      = "results/prepared_data/D.pseudobulk.npz",
+         targets         = "results/prepared_data/D.targets.csv",
          xgb_params      = "scripts/param_grids/xgboost_params_small.json",
          rf_params       = "scripts/param_grids/rf_params.json",
          models          = ["xgboost", "rf"],

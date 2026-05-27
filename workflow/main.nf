@@ -158,9 +158,9 @@ workflow {
     // Input channels
     anndata_ch           = Channel.fromPath(params.anndata,          checkIfExists: true)
     archetype_scores_ch  = Channel.fromPath(params.archetype_scores, checkIfExists: true)
-    xgb_params_ch        = Channel.fromPath("${launchDir}/scripts/param_grids/xgboost_params.json")
-    rf_params_ch         = Channel.fromPath("${launchDir}/scripts/param_grids/rf_params.json")
-    mil_params_ch        = Channel.fromPath("${launchDir}/scripts/param_grids/mil_params.json")
+    xgb_params_ch        = Channel.value(file("${launchDir}/scripts/param_grids/xgboost_params.json"))
+    rf_params_ch         = Channel.value(file("${launchDir}/scripts/param_grids/rf_params.json"))
+    mil_params_ch        = Channel.value(file("${launchDir}/scripts/param_grids/mil_params.json"))
 
     // Celltype→cluster map is optional; pass a sentinel file when not set
     celltype_map_ch = (params.celltype_cluster_map && params.celltype_cluster_map != "")
