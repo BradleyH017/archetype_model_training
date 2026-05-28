@@ -11,7 +11,12 @@ Architecture (Ilse et al., 2018):
 Outputs (in --outdir):
   mil_fold_metrics.csv       — per-fold R² / RMSE + best hyperparams
   mil_oof_predictions.csv    — out-of-fold predictions (samples × archetypes)
-  summary_metrics.csv        — per-archetype OOF metrics
+  mil_summary_metrics.csv    — per-archetype OOF metrics
+
+Label modes (--label_mode):
+  full            — all continuous archetype weights (default, original behaviour)
+  argmax          — full cohort, targets converted to one-hot at dominant archetype
+  argmax_filtered — cohort filtered to max archetype weight > --min_score, then one-hot
 """
 import argparse
 import json
@@ -25,6 +30,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import (
     HAS_TORCH,
+    apply_label_mode,
     load_mil_bags,
     nested_cv_mil,
     per_archetype_metrics,
@@ -46,6 +52,13 @@ def parse_args():
     p.add_argument("--max_cells_per_bag", type=int, default=2000)
     p.add_argument("--seed",              type=int, default=42)
     p.add_argument("--outdir",            required=True)
+    p.add_argument("--label_mode",        default="full",
+                   choices=["full", "argmax", "argmax_filtered"],
+                   help="Target encoding: 'full'=continuous weights, 'argmax'=one-hot at "
+                        "dominant archetype (full cohort), 'argmax_filtered'=one-hot + "
+                        "restrict to samples where max weight > --min_score")
+    p.add_argument("--min_score",         type=float, default=0.5,
+                   help="Minimum dominant archetype weight for argmax_filtered mode")
     return p.parse_args()
 
 
@@ -68,7 +81,17 @@ def main():
     samples = [samples[i] for i in keep]
     y       = df_tgt.loc[samples].values.astype(float)
     arch_cols = df_tgt.columns.tolist()
-    print(f"  {len(bags)} bags × {y.shape[1]} targets")
+
+    y, keep_mask = apply_label_mode(y, args.label_mode, args.min_score)
+    if not keep_mask.all():
+        n_kept = keep_mask.sum()
+        print(f"  label_mode='{args.label_mode}': {(~keep_mask).sum()} samples dropped "
+              f"(max weight ≤ {args.min_score}), {n_kept} remain")
+        bags    = [bags[i]    for i, k in enumerate(keep_mask) if k]
+        samples = [samples[i] for i, k in enumerate(keep_mask) if k]
+        y       = y[keep_mask]
+
+    print(f"  {len(bags)} bags × {y.shape[1]} targets  label_mode={args.label_mode}")
 
     with open(args.mil_params) as f:
         hp_grid = json.load(f)
@@ -87,8 +110,8 @@ def main():
         f"{args.outdir}/mil_oof_predictions.csv")
 
     pd.DataFrame(
-        per_archetype_metrics(y, oof_preds, arch_cols, "mil", args.cluster)
-    ).to_csv(f"{args.outdir}/summary_metrics.csv", index=False)
+        per_archetype_metrics(y, oof_preds, arch_cols, "mil", args.cluster, args.label_mode)
+    ).to_csv(f"{args.outdir}/mil_summary_metrics.csv", index=False)
 
     print(f"\nDone. Results in {args.outdir}")
 

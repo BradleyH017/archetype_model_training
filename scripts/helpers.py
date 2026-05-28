@@ -157,6 +157,26 @@ def get_archetype_weight_cols(df_scores, cluster_prefix):
     return [c for c in df_scores.columns if pat.match(c)]
 
 
+def apply_label_mode(y, mode, min_score=0.5):
+    """Transform targets according to label mode.
+
+    Returns (y_out, keep_mask):
+      'full'            → y unchanged, keep_mask all-True
+      'argmax'          → one-hot at argmax col, keep_mask all-True
+      'argmax_filtered' → one-hot at argmax col, keep_mask where max weight > min_score
+    """
+    if mode == "full":
+        return y.copy(), np.ones(len(y), dtype=bool)
+    argmax_idx = np.argmax(y, axis=1)
+    y_onehot = np.zeros_like(y)
+    y_onehot[np.arange(len(y)), argmax_idx] = 1.0
+    if mode == "argmax_filtered":
+        keep_mask = y.max(axis=1) > min_score
+    else:
+        keep_mask = np.ones(len(y), dtype=bool)
+    return y_onehot, keep_mask
+
+
 # ─── 3. Tree models ───────────────────────────────────────────────────────────
 
 def build_estimator(model_name, param_grid_path, seed, n_jobs=1, device="cpu"):
@@ -472,7 +492,7 @@ def load_oof(directory, prefix):
     return pd.read_csv(path, index_col=0) if os.path.exists(path) else None
 
 
-def per_archetype_metrics(y, oof_preds, arch_cols, model_name, cluster):
+def per_archetype_metrics(y, oof_preds, arch_cols, model_name, cluster, label_mode="full"):
     """Return a list of dicts with per-archetype OOF R² and RMSE."""
     rows = []
     for j, col in enumerate(arch_cols):
@@ -480,5 +500,6 @@ def per_archetype_metrics(y, oof_preds, arch_cols, model_name, cluster):
         r2_c   = r2_score(y[mask, j], oof_preds[mask, j])
         rmse_c = float(np.sqrt(mean_squared_error(y[mask, j], oof_preds[mask, j])))
         rows.append({"model": model_name, "cluster": cluster,
-                     "archetype": col, "r2": r2_c, "rmse": rmse_c})
+                     "archetype": col, "r2": r2_c, "rmse": rmse_c,
+                     "label_mode": label_mode})
     return rows

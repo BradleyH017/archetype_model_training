@@ -4,6 +4,6 @@
     "min_samples_split": [2, 5, 10, 20],
     "min_samples_leaf":  [1, 2, 4, 8],
     "max_features":      ["sqrt", "log2", 0.2, 0.3, 0.5, 0.7],
-    "bootstrap":         [true, false],
+    "bootstrap":         [true],
     "max_samples":       [null, 0.7, 0.8, 0.9]
 }
