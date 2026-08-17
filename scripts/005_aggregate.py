@@ -17,6 +17,14 @@ Outputs (in --outdir):
                                       contributes one number, regardless of how
                                       many targets it has) — a more principled
                                       ranking than model_summary.csv's flat pooling
+  all_clusters_permutation_null.csv — one row per (cluster × model × archetype),
+                                      ElasticNet/Lasso family only: observed R²,
+                                      null mean/std/95th percentile, and p-value.
+                                      Kept as its own table, not merged into
+                                      model_summary_overall.csv — an R² and a
+                                      p-value answer different questions and
+                                      conflating them into one ranking would
+                                      misrepresent both.
   {model}_r2_heatmap.pdf       — R² heatmap: clusters × archetypes
   model_r2_boxplot.pdf         — R² distribution per model
   model_r2_stripplot.pdf       — all data points, faceted by cluster
@@ -107,6 +115,18 @@ def main():
         summary_overall.to_csv(os.path.join(args.outdir, "model_summary_overall.csv"), index=False)
         print("\nModel summary (overall, variance-weighted, averaged across clusters):")
         print(summary_overall.to_string(index=False))
+
+    # ── Permutation null results (ElasticNet/Lasso family only) ───────────────
+    null_dfs = []
+    for d in args.eval_dirs:
+        f = os.path.join(d, "combined_permutation_null.csv")
+        if os.path.exists(f):
+            null_dfs.append(pd.read_csv(f))
+    if null_dfs:
+        df_null = pd.concat(null_dfs, ignore_index=True)
+        df_null.to_csv(os.path.join(args.outdir, "all_clusters_permutation_null.csv"), index=False)
+        print(f"\nLoaded {len(df_null)} permutation-null rows from "
+              f"{df_null['cluster'].nunique()} clusters.")
 
     models = df["model"].unique()
 

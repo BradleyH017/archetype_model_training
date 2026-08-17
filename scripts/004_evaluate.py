@@ -11,6 +11,10 @@ Outputs (in --outdir):
   combined_metrics.csv                      — all models × archetypes × label_modes
   combined_overall_metrics.csv              — one row per (model × label_mode): multivariate
                                                (variance-weighted) R² and aggregate RMSE
+  combined_permutation_null.csv             — one row per (model × archetype), for whichever
+                                               of elasticnet/lasso/elasticnet_indep/lasso_indep
+                                               had a permutation-null result: observed R²,
+                                               null mean/std/95th percentile, and p-value
   model_comparison_bars.pdf                 — R² and RMSE bar charts by model
   {model}_{label_mode}_oof_scatter.pdf      — true vs predicted scatter per archetype
   {model}_{label_mode}_feature_importance.pdf — top-30 features (tree models), or
@@ -39,6 +43,10 @@ def parse_args():
                    help="One directory per (model × label_mode) tree job")
     p.add_argument("--mil_dir",   required=True)
     p.add_argument("--targets",   required=True)
+    p.add_argument("--permutation_null_summaries", nargs="*", default=[],
+                   help="Optional *_permutation_summary.csv files (ElasticNet/Lasso "
+                        "family only) — zero or more, one per model that had a "
+                        "permutation-null result for this cluster")
     p.add_argument("--outdir",    required=True)
     return p.parse_args()
 
@@ -90,6 +98,15 @@ def main():
         df_overall = pd.concat(overall_dfs, ignore_index=True)
         df_overall.to_csv(os.path.join(args.outdir, "combined_overall_metrics.csv"), index=False)
         print(df_overall.to_string(index=False))
+
+    # ── Collect permutation-null test results (ElasticNet/Lasso family only) ──
+    # Zero or more of these — not every model gets a permutation-null result,
+    # and a cluster where none succeeded is fine (nothing to concatenate).
+    null_paths = [p for p in args.permutation_null_summaries if os.path.exists(p)]
+    if null_paths:
+        df_null = pd.concat([pd.read_csv(p) for p in null_paths], ignore_index=True)
+        df_null.to_csv(os.path.join(args.outdir, "combined_permutation_null.csv"), index=False)
+        print(df_null.to_string(index=False))
 
     # ── Model comparison bar charts ───────────────────────────────────────────
     # Group by model+label_mode so each bar is a distinct (model, mode) combo.

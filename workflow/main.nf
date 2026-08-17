@@ -82,6 +82,12 @@ process TRAIN_TREE_MODELS {
 
     output:
     tuple val(cluster), path("${cluster}_${model}_${label_mode}_tree/"), emit: results
+    // Same data as `results`, additionally tagged with model/label_mode — lets
+    // PERMUTATION_NULL below filter to specific models without needing to
+    // parse them back out of the directory name (label_mode can itself
+    // contain underscores, e.g. "argmax_filtered", making that parsing
+    // ambiguous). `results` is untouched so nothing downstream of it changes.
+    tuple val(cluster), val(model), val(label_mode), path("${cluster}_${model}_${label_mode}_tree/"), emit: results_tagged
 
     script:
     // Only xgboost gets extra inner-search parallelism (it's the one hitting
@@ -113,6 +119,52 @@ process TRAIN_TREE_MODELS {
         --n_jobs_inner     ${n_jobs_inner_this} \\
         --n_jobs_models    1 \\
         --outdir           ${cluster}_${model}_${label_mode}_tree
+    """
+}
+
+// ─── 2a-null. Per-PC permutation null test (ElasticNet/Lasso family only) ────
+// Submitted as one job per (cluster × model × label_mode), for whichever of
+// elasticnet/lasso/elasticnet_indep/lasso_indep actually ran. Fixes
+// hyperparameters to the mode already chosen across TRAIN_TREE_MODELS' own
+// outer folds (its {model}_fold_metrics.csv) — no new hyperparameter search —
+// so this is cheap enough to run automatically for every model, before you've
+// decided which one to use, rather than only against a single finalized pick.
+process PERMUTATION_NULL {
+    label 'mem_32gb'
+    container params.container_ml
+    tag "${cluster}_${model}_${label_mode}"
+    publishDir "${params.outdir}/permutation_null/${cluster}/${model}/${label_mode}", mode: 'copy'
+
+    input:
+    tuple val(cluster), path(tree_dir), val(model), val(label_mode), path(pseudobulk), path(targets)
+    path xgb_param_grid
+    path rf_param_grid
+    path elasticnet_param_grid
+    path lasso_param_grid
+
+    output:
+    tuple val(cluster), path("*_permutation_summary.csv"), path("*_permutation_null_raw.csv"), emit: results
+
+    script:
+    """
+    python ${launchDir}/scripts/007_permutation_null.py \\
+        --cluster        ${cluster} \\
+        --pseudobulk     ${pseudobulk} \\
+        --targets        ${targets} \\
+        --model          ${model} \\
+        --fold_metrics   ${tree_dir}/${model}_fold_metrics.csv \\
+        --xgb_params     ${xgb_param_grid} \\
+        --rf_params      ${rf_param_grid} \\
+        --elasticnet_params ${elasticnet_param_grid} \\
+        --lasso_params   ${lasso_param_grid} \\
+        --hvg_pct        ${params.hvg_pct} \\
+        --hvg_max        ${params.hvg_max} \\
+        --n_permutations ${params.n_permutations} \\
+        --n_folds        ${params.n_outer_folds} \\
+        --label_mode     ${label_mode} \\
+        --min_score      ${params.min_score} \\
+        --seed           ${params.random_seed} \\
+        --outdir         .
     """
 }
 
@@ -161,7 +213,7 @@ process EVALUATE_MODELS {
     publishDir "${params.outdir}/evaluation/${cluster}", mode: 'copy'
 
     input:
-    tuple val(cluster), path(tree_dirs), path(mil_dirs), path(targets)
+    tuple val(cluster), path(tree_dirs), path(mil_dirs), path(targets), path(perm_null_summaries)
 
     output:
     path "${cluster}_eval/", emit: eval_dir
@@ -174,6 +226,7 @@ process EVALUATE_MODELS {
         --tree_dirs ${tree_dirs} \\
         --mil_dir   ${mil_dirs} \\
         --targets   ${targets} \\
+        --permutation_null_summaries ${perm_null_summaries} \\
         --outdir    ${cluster}_eval
     """
 }
@@ -268,6 +321,42 @@ workflow {
     tree_results_ch = TRAIN_TREE_MODELS.out.results.groupTuple()
     // tree_results_ch: [cluster, [dir_xgboost_full, dir_xgboost_argmax, ..., dir_rf_argmax_filtered]]
 
+    // Step 2a-null: per-PC permutation null test, ElasticNet/Lasso family only —
+    // fixes hyperparameters from each job's own {model}_fold_metrics.csv (no new
+    // search), so it's cheap enough to run automatically for every one of these
+    // models/clusters before you've picked a winner, feeding into EVALUATE_MODELS
+    // below rather than being a manual follow-up on a single chosen model.
+    def NULL_TEST_MODELS = ['elasticnet', 'lasso', 'elasticnet_indep', 'lasso_indep']
+    // Up to 4 models share the same cluster key here. Nextflow's join() silently
+    // drops all but the first match when a key repeats on one side (see
+    // https://github.com/nextflow-io/nextflow/issues/654) — with 4
+    // elasticnet/lasso variants all keyed by the same cluster, join() would only
+    // ever pass through whichever model's result happened to arrive first,
+    // silently dropping the other 3. Broadcast via a cluster->value Map lookup
+    // instead (.combine() against a single-emission value channel), which can't
+    // drop anything regardless of how many models share a key.
+    pseudobulk_map_ch = pseudobulk_ch.toList().map { it.collectEntries { c, pb  -> [(c): pb] } }
+    targets_map_ch    = targets_ch.toList().map    { it.collectEntries { c, tgt -> [(c): tgt] } }
+    perm_null_input_ch = TRAIN_TREE_MODELS.out.results_tagged
+        .filter { cluster, model, label_mode, dir -> model in NULL_TEST_MODELS }
+        .combine(pseudobulk_map_ch)
+        .combine(targets_map_ch)
+        .map { cluster, model, label_mode, dir, pbMap, tgtMap ->
+            [cluster, dir, model, label_mode, pbMap[cluster], tgtMap[cluster]]
+        }
+    // perm_null_input_ch: [cluster, tree_dir, model, label_mode, pseudobulk, targets]
+    PERMUTATION_NULL(perm_null_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch)
+
+    // Only thread the summary CSV into EVALUATE_MODELS (the raw per-permutation
+    // draws stay published under results/permutation_null/ for direct inspection
+    // but don't need to flow through the eval/aggregate chain).
+    perm_null_results_ch = PERMUTATION_NULL.out.results
+        .map { cluster, summary, raw -> [cluster, summary] }
+        .groupTuple()
+    // perm_null_results_ch: [cluster, [summary_elasticnet, summary_lasso, ...]]
+    // — however many of the 4 target models actually succeeded for that cluster,
+    // not necessarily all 4.
+
     // Step 2b: MIL — fan out to one job per (cluster × label_mode)
     mil_input_ch = mil_bags_ch
         .join(targets_ch)
@@ -284,11 +373,18 @@ workflow {
     }
     // mil_results_ch: [cluster, [mil_dir_full, mil_dir_argmax, mil_dir_argmax_filtered]]
 
-    // Step 3: Evaluate — join tree + MIL results + targets by cluster
+    // Step 3: Evaluate — join tree + MIL results + targets + permutation-null by cluster.
+    // The permutation-null join uses remainder:true so a cluster is never dropped
+    // from evaluation entirely in the (unlikely) case none of the 4 target models'
+    // null tests succeeded for it — missing entries become null, mapped to [] below.
     eval_input_ch = tree_results_ch
         .join(mil_results_ch)
         .join(targets_ch)
-    // eval_input_ch: [cluster, [tree_dirs], [mil_dirs], targets]
+        .join(perm_null_results_ch, remainder: true)
+        .map { cluster, tree_dirs, mil_dirs, targets, perm_null_summaries ->
+            [cluster, tree_dirs, mil_dirs, targets, perm_null_summaries ?: []]
+        }
+    // eval_input_ch: [cluster, [tree_dirs], [mil_dirs], targets, [perm_null_summaries]]
     EVALUATE_MODELS(eval_input_ch)
 
     // Step 4: Aggregate all cluster evaluations

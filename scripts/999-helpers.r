@@ -3,9 +3,9 @@
 #' @param resdir Path to results directory containing model outputs
 #' @return List with three data frames: summary_metrics, fold_metrics, feature_importance
 #' @details Each file is annotated with cluster (from parent directory) and indep_model flag
-load_model_files = function(resdir){
+load_model_files = function(resdir, permute_dir){
     # Helper function to reduce code duplication
-    load_and_combine = function(pattern, label) {
+    load_and_combine = function(resdir, pattern, label) {
         files = list.files(resdir, pattern = pattern, full.names = TRUE, recursive = TRUE)
         
         if (length(files) == 0) {
@@ -32,15 +32,17 @@ load_model_files = function(resdir){
     }
     
     # Load each file type
-    summary_metrics = load_and_combine("summary_metrics.csv", "summary")
-    fold_metrics = load_and_combine("fold_metrics.csv", "fold")
-    feature_importance = load_and_combine("feature_importances.csv", "feature")
-    overall = load_and_combine("overall_metrics.csv", "overall")
+    summary_metrics = load_and_combine(resdir, "summary_metrics.csv", "summary")
+    fold_metrics = load_and_combine(resdir, "fold_metrics.csv", "fold")
+    feature_importance = load_and_combine(resdir, "feature_importances.csv", "feature")
+    overall = load_and_combine(resdir, "overall_metrics.csv", "overall")
+    permute = load_and_combine(permute_dir, "permutation_summary.csv", "permutation")
 
     return(list(
         sum = summary_metrics,
         fold = fold_metrics,
         feature = feature_importance,
-        overall = overall
+        overall = overall,
+        permute = permute
     ))
 }

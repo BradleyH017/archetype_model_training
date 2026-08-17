@@ -6,7 +6,7 @@ Sections:
   1. Data I/O          — load_pseudobulk, load_mil_bags
   2. Feature prep      — filter_lowly_expressed_genes, select_hvgs, pseudobulk_aggregate,
                          compute_abundance, get_archetype_weight_cols
-  3. Tree/linear models — build_estimator, run_nested_cv_tree
+  3. Tree/linear models — build_estimator, run_nested_cv_tree, run_fixed_cv
                          (xgboost, rf, elasticnet, lasso)
   4. MIL               — AttentionMIL, MILDataset, mil_collate, train_epoch,
                          evaluate_bags, build_mil_model, fit_mil_model,
@@ -375,6 +375,69 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
             all_imps.append((sel_idx, imp))
 
     return fold_metrics, oof_preds, all_imps
+
+
+def run_fixed_cv(X, y, model_name, best_params, param_grid_path, n_folds, seed,
+                 n_gene_features=None, hvg_pct=None, hvg_max=None):
+    """Plain (non-nested) K-fold CV with FIXED hyperparameters — no inner search.
+
+    Used for permutation-null testing (007_permutation_null.py): the expensive
+    part of nested CV (the RandomizedSearchCV inner loop) is replaced by
+    directly building an estimator with the given best_params. HVGs are still
+    reselected fresh per fold from that fold's training data only (see
+    select_hvgs / _fit_outer_fold), exactly as in the real nested-CV pipeline
+    — only the hyperparameter *search* is skipped, not the feature reselection.
+
+    best_params : dict, applied to every target (joint models: xgboost/rf/
+        elasticnet/lasso) — OR a list of dicts, one per target column, in the
+        same order as y's columns (independent models: elasticnet_indep/
+        lasso_indep).
+    param_grid_path : passed through to build_estimator purely to construct
+        the base estimator object; its grid contents are irrelevant here since
+        hyperparameters are immediately overridden via set_params().
+
+    Returns oof_preds (n_samples × n_targets).
+    """
+    n_targets = y.shape[1]
+    outer_cv  = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    oof_preds = np.full_like(y, np.nan, dtype=float)
+
+    is_indep = isinstance(best_params, list)
+
+    for tr_idx, te_idx in outer_cv.split(X):
+        X_tr_full, X_te_full = X[tr_idx], X[te_idx]
+        y_tr = y[tr_idx]
+
+        if n_gene_features is not None:
+            hvg_idx_local = select_hvgs(X_tr_full[:, :n_gene_features], hvg_pct, hvg_max)
+            abund_idx     = np.arange(n_gene_features, X_tr_full.shape[1])
+            sel_idx       = np.concatenate([hvg_idx_local, abund_idx])
+        else:
+            sel_idx = np.arange(X_tr_full.shape[1])
+
+        X_tr, X_te = X_tr_full[:, sel_idx], X_te_full[:, sel_idx]
+
+        scaler  = StandardScaler()
+        X_tr_sc = scaler.fit_transform(X_tr)
+        X_te_sc = scaler.transform(X_te)
+
+        if is_indep:
+            for j in range(n_targets):
+                base, _ = build_estimator(model_name, param_grid_path, seed)
+                base.set_params(**best_params[j])
+                base.fit(X_tr_sc, y_tr[:, j])
+                oof_preds[te_idx, j] = base.predict(X_te_sc)
+        else:
+            base, _ = build_estimator(model_name, param_grid_path, seed)
+            base.set_params(**best_params)
+            y_fit = y_tr if n_targets > 1 else y_tr.ravel()
+            base.fit(X_tr_sc, y_fit)
+            y_pred = base.predict(X_te_sc)
+            if y_pred.ndim == 1:
+                y_pred = y_pred.reshape(-1, 1)
+            oof_preds[te_idx] = y_pred
+
+    return oof_preds
 
 
 def combine_fold_importances(all_imps, n_total_features):

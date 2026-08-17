@@ -38,6 +38,7 @@ model_training/
 │   ├── 004_evaluate.py          # Per-cluster evaluation & plots
 │   ├── 005_aggregate.py         # Cross-cluster summary & plots
 │   ├── 006_finalize_model.py    # Manual: refit one deployable model on all data
+│   ├── 007_permutation_null.py  # Automatic: per-PC permutation null test (ElasticNet/Lasso family)
 │   └── param_grids/
 │       ├── xgboost_params.json
 │       ├── rf_params.json
@@ -106,6 +107,23 @@ When `raw_or_clr_pca == "pca"` and `run_independent_pca_fits` is enabled, two ex
 | `{model}_summary_metrics.csv` | Per-archetype OOF R² and RMSE |
 | `{model}_overall_metrics.csv` | One aggregate row: multivariate (variance-weighted) R² and aggregate RMSE across ALL of the cluster's targets at once |
 
+### 2a · Permutation null test (`007_permutation_null.py`)
+
+Runs automatically for the ElasticNet/Lasso family only (`elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep` — not xgboost/rf/mil), right after step 2, one job per (cluster × model × label_mode). Answers a more targeted question than "is this R² impressive": *does this specific model, with the hyperparameters its own nested CV actually settled on, explain more variance in each archetype PC than you'd get by chance?*
+
+Hyperparameters are **not re-searched** — they're fixed to the mode (most common choice) across that model's own `{model}_fold_metrics.csv` rows from step 2, so each permutation is just one plain (non-nested) K-fold CV pass with no inner `RandomizedSearchCV` loop. That's what makes it cheap enough to run automatically for every model before you've picked a winner, rather than only against a single already-chosen one — this script has no dependency on `006_finalize_model.py`.
+
+For each archetype PC: an "observed" R² is computed under the fixed-hyperparameter K-fold CV (same fold split used for every run). Sample labels (`y`, all target columns shuffled together as one consistent row permutation, preserving cross-target structure while breaking the X↔y link) are then shuffled `n_permutations` times, refitting the same fixed-hyperparameter procedure each time — including fresh per-fold HVG reselection, since that's part of the procedure being tested, not something to hold fixed — to build a null R² distribution. An empirical p-value per PC is `(1 + count(null_r2 >= observed_r2)) / (n_permutations + 1)`.
+
+**Outputs** under `results/permutation_null/{cluster}/{model}/{label_mode}/`:
+
+| File | Contents |
+|---|---|
+| `{cluster}_{model}_{label_mode}_permutation_summary.csv` | One row per archetype: observed R², null mean/std/95th percentile, p-value |
+| `{cluster}_{model}_{label_mode}_permutation_null_raw.csv` | Every individual permutation's per-PC R² (long format), plus the observed run tagged `permutation_id = -1`, for plotting a null histogram |
+
+Only the summary CSV is threaded into `EVALUATE_MODELS`/`AGGREGATE_RESULTS` below (see `combined_permutation_null.csv` / `all_clusters_permutation_null.csv`); the raw per-permutation draws stay published here for direct inspection if you want to plot a histogram yourself.
+
 ### 3 · Train MIL (`003_train_mil.py`)
 
 Trains a **gated-attention MIL** model (Ilse et al., 2018). Each sample is a *bag* of cells; the model learns an attention-weighted pooling over cells before making a simplex prediction.
@@ -127,6 +145,7 @@ Combines metrics from all models for a single cluster and generates:
 
 - `combined_metrics.csv` — all models × archetypes
 - `combined_overall_metrics.csv` — one row per (model × label_mode): multivariate (variance-weighted) R² and aggregate RMSE
+- `combined_permutation_null.csv` — ElasticNet/Lasso family only: observed R², null distribution stats, and p-value per archetype (see step 2a) — absent/empty if none of those models succeeded for this cluster
 - `model_comparison_bars.pdf` — R² and RMSE bar charts by archetype
 - `{model}_oof_scatter.pdf` — true vs predicted scatter per archetype
 - `{model}_feature_importance.pdf` — top-30 features (tree models)
@@ -139,6 +158,7 @@ Collects evaluation outputs across all clusters and generates:
 - `model_summary.csv` — mean / median / std R² and RMSE per model, pooled uniformly across every individual archetype/PC row (a cluster with more targets counts more)
 - `all_clusters_overall_metrics.csv` — one row per (cluster × model × label_mode) multivariate metric
 - `model_summary_overall.csv` — per model, `r2_variance_weighted`/`rmse_aggregate` averaged **across clusters** (each cluster contributes one number regardless of how many targets it has) — a more principled ranking than `model_summary.csv`'s flat pooling, worth checking alongside it rather than instead of it
+- `all_clusters_permutation_null.csv` — every cluster's `combined_permutation_null.csv` rows pooled together (ElasticNet/Lasso family only). Kept as its own table rather than merged into `model_summary_overall.csv` — an R² and a p-value answer different questions, and conflating them into one ranking would misrepresent both
 - `{model}_r2_heatmap.pdf` — R² heatmap (clusters × archetypes)
 - `model_r2_boxplot.pdf` — R² distribution per model
 - `model_r2_stripplot.pdf` — per-archetype R², faceted by cluster
@@ -167,6 +187,8 @@ It selects HVGs once (from all samples — there's no held-out fold left to prot
 
 Supports `xgboost`, `rf`, `elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep`. **Does not support `mil`** — MIL's persistence needs a meaningfully different format (torch model state, attention weights); passing `--model mil` raises a clear error.
 
+Note: the permutation-null significance test (`007_permutation_null.py`) is a separate concern from finalizing — it runs automatically in the main pipeline for the ElasticNet/Lasso family, from each model's own real nested-CV fold_metrics, with no dependency on this script. See step 2a above.
+
 ---
 
 ## Key parameters (`conf/training.config`)
@@ -187,6 +209,7 @@ Supports `xgboost`, `rf`, `elasticnet`, `lasso`, `elasticnet_indep`, `lasso_inde
 | `n_inner_folds` | `5` | Inner CV folds (HPO) |
 | `n_hpo_iter_tree` | `50` | RandomizedSearch iterations (tree models) |
 | `n_hpo_iter_mil` | `20` | Random HPO draws (MIL) |
+| `n_permutations` | `100` | Permutation-null draws per (cluster × ElasticNet/Lasso-family model); uses `n_outer_folds` for its fold count, no separate hyperparameter search |
 | `max_cells_per_bag` | `2000` | Cells subsampled per sample for MIL |
 | `random_seed` | `42` | Global random seed |
 
