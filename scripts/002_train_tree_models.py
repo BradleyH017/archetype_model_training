@@ -1,13 +1,42 @@
 #!/usr/bin/env python3
 """
 002_train_tree_models.py
-Nested cross-validation for XGBoost and/or RandomForest on pseudo-bulk archetype prediction.
+Nested cross-validation for XGBoost, RandomForest, ElasticNet and/or Lasso on
+pseudo-bulk archetype prediction. ElasticNet/Lasso use the joint multi-task
+variants (MultiTaskElasticNet/MultiTaskLasso): one regularized fit per cluster
+across all its archetype targets, sharing feature selection but keeping a
+per-target coefficient.
+
+"elasticnet_indep"/"lasso_indep" (only added to --models when
+raw_or_clr_pca == 'pca' and run_independent_pca_fits is enabled) fit an
+independent single-output ElasticNet/Lasso per target instead — no shared
+feature support across targets — to compare against the joint fits above.
+This matters because PCA targets are orthogonal by construction, which
+weakens the multi-task assumption that targets share a common feature set.
+
+HVGs are reselected independently for each outer CV fold, from that fold's
+training samples only (--hvg_pct/--hvg_max here, not in 001_prepare_data.py)
+— see helpers.select_hvgs / _fit_outer_fold. This avoids ranking genes by
+variance across samples that later become test data.
 
 Outputs (in --outdir):
   {model}_fold_metrics.csv         — per-fold mean R² / RMSE + best params
   {model}_oof_predictions.csv      — out-of-fold predictions (samples × archetypes)
-  {model}_feature_importances.csv  — mean importance across outer folds
+  {model}_feature_importances.csv  — mean importance across outer folds;
+                                      for elasticnet/lasso this is a per-archetype
+                                      signed coefficient table (feature × archetype)
+                                      rather than a single importance column
   {model}_summary_metrics.csv      — per-archetype OOF R² / RMSE (one file per model)
+  {model}_overall_metrics.csv      — one aggregate row per model: multivariate
+                                      (variance-weighted) R² and aggregate RMSE
+                                      across ALL targets at once — see
+                                      helpers.overall_metrics
+
+Hyperparameter search and per-fold R² both use multioutput='variance_weighted'
+scoring (not 'uniform_average'): each target column's contribution is weighted
+by its own variance rather than averaged uniformly. For CLR-PCA targets this
+is equivalent to a proper multivariate R² based on total squared Euclidean
+(Aitchison) distance, since PCA preserves distance.
 
 Label modes (--label_mode):
   full            — all continuous archetype weights (default, original behaviour)
@@ -30,9 +59,12 @@ sys.path.append("scripts")
 from helpers import (
     apply_label_mode,
     build_estimator,
+    combine_fold_importances,
     load_pseudobulk,
+    overall_metrics,
     per_archetype_metrics,
     run_nested_cv_tree,
+    run_nested_cv_independent,
 )
 
 
@@ -43,7 +75,13 @@ def parse_args():
     p.add_argument("--targets",          required=True)
     p.add_argument("--xgb_params",       required=True)
     p.add_argument("--rf_params",        required=True)
+    p.add_argument("--elasticnet_params", required=True)
+    p.add_argument("--lasso_params",     required=True)
     p.add_argument("--models",           nargs="+", default=["xgboost", "rf"])
+    p.add_argument("--hvg_pct",          type=float, default=0.20,
+                   help="Per-outer-fold HVG selection: fraction of candidate genes to keep")
+    p.add_argument("--hvg_max",          type=int,   default=2000,
+                   help="Per-outer-fold HVG selection: hard cap on number of HVGs")
     p.add_argument("--n_outer_folds",    type=int, default=5)
     p.add_argument("--n_inner_folds",    type=int, default=5)
     p.add_argument("--n_iter",           type=int, default=50)
@@ -79,7 +117,11 @@ def parse_args():
          targets         = "results/prepared_data/D.targets.csv",
          xgb_params      = "scripts/param_grids/xgboost_params_small.json",
          rf_params       = "scripts/param_grids/rf_params.json",
+         elasticnet_params = "scripts/param_grids/elasticnet_params.json",
+         lasso_params    = "scripts/param_grids/lasso_params.json",
          models          = ["xgboost"],        # one model per job; swap to ["xgboost"] as needed
+         hvg_pct         = 0.20,
+         hvg_max         = 2000,
          n_outer_folds   = 5,
          n_inner_folds   = 5,
          n_iter          = 50,
@@ -98,20 +140,39 @@ def parse_args():
     return p.parse_args()
 
 
-def _run_one_model(model_name, args, estimator_n_jobs, X, y, arch_cols, samples, feature_names):
+def _run_one_model(model_name, args, estimator_n_jobs, X, y, arch_cols, samples, feature_names,
+                    n_gene_features):
     """Train a single model with nested CV and return its results."""
-    param_path = args.xgb_params if model_name == "xgboost" else args.rf_params
+    param_path = {
+        "xgboost":          args.xgb_params,
+        "rf":               args.rf_params,
+        "elasticnet":       args.elasticnet_params,
+        "lasso":            args.lasso_params,
+        "elasticnet_indep": args.elasticnet_params,
+        "lasso_indep":      args.lasso_params,
+    }[model_name]
     device     = args.device if model_name == "xgboost" else "cpu"
     base, grid = build_estimator(model_name, param_path, args.seed,
                                  n_jobs=estimator_n_jobs, device=device)
     print(f"\n{'='*40}\n{model_name.upper()}", flush=True)
-    fold_metrics, oof_preds, all_imps = run_nested_cv_tree(
-        X, y, model_name, base, grid,
-        args.n_outer_folds, args.n_inner_folds, args.n_iter,
-        args.seed, feature_names,
-        n_jobs_outer=args.n_jobs_outer,
-        n_jobs_inner=args.n_jobs_inner,
-    )
+    if model_name in ("elasticnet_indep", "lasso_indep"):
+        fold_metrics, oof_preds, all_imps = run_nested_cv_independent(
+            X, y, model_name, base, grid,
+            args.n_outer_folds, args.n_inner_folds, args.n_iter,
+            args.seed, feature_names, target_names=arch_cols,
+            n_jobs_outer=args.n_jobs_outer,
+            n_jobs_inner=args.n_jobs_inner,
+            n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
+        )
+    else:
+        fold_metrics, oof_preds, all_imps = run_nested_cv_tree(
+            X, y, model_name, base, grid,
+            args.n_outer_folds, args.n_inner_folds, args.n_iter,
+            args.seed, feature_names,
+            n_jobs_outer=args.n_jobs_outer,
+            n_jobs_inner=args.n_jobs_inner,
+            n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
+        )
     return model_name, fold_metrics, oof_preds, all_imps
 
 
@@ -126,7 +187,10 @@ def main():
         estimator_n_jobs = 1 if (args.n_jobs_outer != 1 or args.n_jobs_inner != 1) else 4
 
     print(f"Loading pseudo-bulk from {args.pseudobulk}")
-    X, samples, feature_names = load_pseudobulk(args.pseudobulk)
+    X, samples, feature_names, n_gene_features = load_pseudobulk(args.pseudobulk)
+    print(f"  {n_gene_features} candidate genes + {len(feature_names) - n_gene_features} "
+          f"abundance features; HVGs reselected per outer fold "
+          f"(hvg_pct={args.hvg_pct}, hvg_max={args.hvg_max})")
 
     print(f"Loading targets from {args.targets}")
     df_tgt = pd.read_csv(args.targets, index_col=0)
@@ -157,13 +221,15 @@ def main():
 
     model_results = Parallel(n_jobs=n_jobs_models, prefer="processes")(
         delayed(_run_one_model)(
-            model_name, args, estimator_n_jobs, X, y, arch_cols, samples, feature_names
+            model_name, args, estimator_n_jobs, X, y, arch_cols, samples, feature_names,
+            n_gene_features,
         )
         for model_name in args.models
     )
 
     for model_name, fold_metrics, oof_preds, all_imps in model_results:
         metrics = per_archetype_metrics(y, oof_preds, arch_cols, model_name, args.cluster, args.label_mode)
+        overall = overall_metrics(y, oof_preds, model_name, args.cluster, args.label_mode)
 
         pd.DataFrame(fold_metrics).to_csv(
             f"{args.outdir}/{model_name}_fold_metrics.csv", index=False)
@@ -174,11 +240,32 @@ def main():
         pd.DataFrame(metrics).to_csv(
             f"{args.outdir}/{model_name}_summary_metrics.csv", index=False)
 
+        pd.DataFrame([overall]).to_csv(
+            f"{args.outdir}/{model_name}_overall_metrics.csv", index=False)
+
         if all_imps:
-            mean_imp = np.mean(all_imps, axis=0)
-            (pd.DataFrame({"feature": feature_names, "importance": mean_imp})
-               .sort_values("importance", ascending=False)
-               .to_csv(f"{args.outdir}/{model_name}_feature_importances.csv", index=False))
+            # Fold-specific HVG reselection means different outer folds may have
+            # kept different gene columns; combine_fold_importances scatters each
+            # fold's importances onto the full feature axis (NaN where a gene
+            # wasn't selected that fold) before averaging, and also reports how
+            # many folds selected each feature — a useful stability diagnostic.
+            mean_imp, n_folds_selected = combine_fold_importances(all_imps, len(feature_names))
+            mean_imp_filled = np.nan_to_num(mean_imp)
+            if mean_imp.ndim == 1:
+                (pd.DataFrame({"feature": feature_names,
+                               "importance": mean_imp_filled,
+                               "n_folds_selected": n_folds_selected})
+                   .sort_values("importance", ascending=False)
+                   .to_csv(f"{args.outdir}/{model_name}_feature_importances.csv", index=False))
+            else:
+                # Joint multi-task and independent-per-target linear models both
+                # produce mean_imp as (n_targets, n_features). Keep one signed
+                # coefficient column per archetype so individual clr_pca targets
+                # can still be traced back to informative genes.
+                df_imp = (pd.DataFrame(mean_imp_filled.T, index=feature_names, columns=arch_cols)
+                            .rename_axis("feature"))
+                df_imp["n_folds_selected"] = n_folds_selected
+                df_imp.to_csv(f"{args.outdir}/{model_name}_feature_importances.csv")
 
     print(f"\nDone. Results in {args.outdir}")
 

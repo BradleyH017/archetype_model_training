@@ -8,10 +8,26 @@ Architecture (Ilse et al., 2018):
   - Gated attention pooling → single bag embedding
   - Bag-level predictor with softmax (simplex output)
 
+HVGs are reselected independently for each outer CV fold, from that fold's
+training samples only (--hvg_pct/--hvg_max here, not in 001_prepare_data.py):
+each training bag's cells are pseudobulked (--pseudobulk_agg), then ranked by
+variance across those per-sample profiles — the same statistic used for the
+tree/linear models in 002_train_tree_models.py — rather than from a fixed
+pre-selected panel. This avoids ranking genes using cells from samples that
+end up in the held-out test fold.
+
+Hyperparameter comparison and per-fold R² both use multioutput='variance_weighted'
+scoring (not 'uniform_average'): each target column's contribution is weighted
+by its own variance rather than averaged uniformly. For CLR-PCA targets this
+is equivalent to a proper multivariate R² based on total squared Euclidean
+(Aitchison) distance, since PCA preserves distance.
+
 Outputs (in --outdir):
   mil_fold_metrics.csv       — per-fold R² / RMSE + best hyperparams
   mil_oof_predictions.csv    — out-of-fold predictions (samples × archetypes)
   mil_summary_metrics.csv    — per-archetype OOF metrics
+  mil_overall_metrics.csv    — one aggregate row: multivariate (variance-weighted)
+                                R² and aggregate RMSE across ALL targets at once
 
 Label modes (--label_mode):
   full            — all continuous archetype weights (default, original behaviour)
@@ -33,6 +49,7 @@ from helpers import (
     apply_label_mode,
     load_mil_bags,
     nested_cv_mil,
+    overall_metrics,
     per_archetype_metrics,
 )
 
@@ -46,6 +63,13 @@ def parse_args():
     p.add_argument("--mil_bags",          required=True)
     p.add_argument("--targets",           required=True)
     p.add_argument("--mil_params",        required=True)
+    p.add_argument("--hvg_pct",           type=float, default=0.20,
+                   help="Per-outer-fold HVG selection: fraction of candidate genes to keep")
+    p.add_argument("--hvg_max",           type=int,   default=2000,
+                   help="Per-outer-fold HVG selection: hard cap on number of HVGs")
+    p.add_argument("--pseudobulk_agg",    choices=["mean", "sum"], default="mean",
+                   help="How to aggregate a fold's training bags to per-sample profiles "
+                        "for HVG ranking (should match 001_prepare_data.py's setting)")
     p.add_argument("--n_outer_folds",     type=int, default=5)
     p.add_argument("--n_inner_folds",     type=int, default=5)
     p.add_argument("--n_iter",            type=int, default=20)
@@ -69,10 +93,13 @@ def main():
     print(f"Device: {device}")
 
     print(f"Loading bags from {args.mil_bags}")
-    bags, samples = load_mil_bags(args.mil_bags)
+    bags, samples, n_gene_features = load_mil_bags(args.mil_bags)
     print(f"  {len(bags)} bags  |  cells/bag: "
           f"min={min(b.shape[0] for b in bags)} "
           f"max={max(b.shape[0] for b in bags)}")
+    print(f"  {n_gene_features} candidate genes + {bags[0].shape[1] - n_gene_features} "
+          f"abundance features; HVGs reselected per outer fold "
+          f"(hvg_pct={args.hvg_pct}, hvg_max={args.hvg_max})")
 
     print(f"Loading targets from {args.targets}")
     df_tgt  = pd.read_csv(args.targets, index_col=0)
@@ -101,6 +128,8 @@ def main():
         bags, y, hp_grid,
         args.n_outer_folds, args.n_inner_folds, args.n_iter,
         args.max_cells_per_bag, args.seed, device,
+        n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
+        pseudobulk_agg=args.pseudobulk_agg,
     )
 
     pd.DataFrame(fold_metrics).to_csv(
@@ -112,6 +141,10 @@ def main():
     pd.DataFrame(
         per_archetype_metrics(y, oof_preds, arch_cols, "mil", args.cluster, args.label_mode)
     ).to_csv(f"{args.outdir}/mil_summary_metrics.csv", index=False)
+
+    pd.DataFrame([
+        overall_metrics(y, oof_preds, "mil", args.cluster, args.label_mode)
+    ]).to_csv(f"{args.outdir}/mil_overall_metrics.csv", index=False)
 
     print(f"\nDone. Results in {args.outdir}")
 

@@ -9,9 +9,13 @@ accepts multiple directories.  MIL remains a single directory (--mil_dir).
 
 Outputs (in --outdir):
   combined_metrics.csv                      — all models × archetypes × label_modes
+  combined_overall_metrics.csv              — one row per (model × label_mode): multivariate
+                                               (variance-weighted) R² and aggregate RMSE
   model_comparison_bars.pdf                 — R² and RMSE bar charts by model
   {model}_{label_mode}_oof_scatter.pdf      — true vs predicted scatter per archetype
-  {model}_{label_mode}_feature_importance.pdf — top-30 features (tree models only)
+  {model}_{label_mode}_feature_importance.pdf — top-30 features (tree models), or
+                                                 top-15 signed coefficients per
+                                                 archetype (elasticnet/lasso)
 """
 import argparse
 import glob
@@ -77,6 +81,16 @@ def main():
     df_metrics.to_csv(os.path.join(args.outdir, "combined_metrics.csv"), index=False)
     print(df_metrics.to_string(index=False))
 
+    # ── Collect overall (multivariate, variance-weighted) metrics ────────────
+    overall_csvs = []
+    for d in all_dirs:
+        overall_csvs += glob.glob(os.path.join(d, "*_overall_metrics.csv"))
+    overall_dfs = [pd.read_csv(p) for p in sorted(set(overall_csvs)) if os.path.exists(p)]
+    if overall_dfs:
+        df_overall = pd.concat(overall_dfs, ignore_index=True)
+        df_overall.to_csv(os.path.join(args.outdir, "combined_overall_metrics.csv"), index=False)
+        print(df_overall.to_string(index=False))
+
     # ── Model comparison bar charts ───────────────────────────────────────────
     # Group by model+label_mode so each bar is a distinct (model, mode) combo.
     df_metrics["model_mode"] = df_metrics["model"] + "/" + df_metrics.get("label_mode", "full")
@@ -139,19 +153,47 @@ def main():
         plt.close()
 
     # ── Feature importance plots ──────────────────────────────────────────────
+    # Tree models write a single unsigned {feature, importance} column.
+    # Joint linear models (elasticnet/lasso) write a signed coefficient per
+    # archetype instead, so each gets its own subplot below.
     for model_name, label_mode, mdir in tree_sources:
         imp_path = os.path.join(mdir, f"{model_name}_feature_importances.csv")
         if not os.path.exists(imp_path):
             continue
-        df_imp = pd.read_csv(imp_path).head(30)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.barh(df_imp["feature"].iloc[::-1], df_imp["importance"].iloc[::-1])
-        ax.set_title(f"Cluster {args.cluster} — {model_name.upper()} [{label_mode}] top-30 features")
-        ax.set_xlabel("Mean importance")
-        plt.tight_layout()
-        plt.savefig(os.path.join(args.outdir,
-                                 f"{model_name}_{label_mode}_feature_importance.pdf"), dpi=150)
-        plt.close()
+        df_imp = pd.read_csv(imp_path)
+
+        if "importance" in df_imp.columns:
+            df_top = df_imp.sort_values("importance", ascending=False).head(30)
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.barh(df_top["feature"].iloc[::-1], df_top["importance"].iloc[::-1])
+            ax.set_title(f"Cluster {args.cluster} — {model_name.upper()} [{label_mode}] top-30 features")
+            ax.set_xlabel("Mean importance")
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.outdir,
+                                     f"{model_name}_{label_mode}_feature_importance.pdf"), dpi=150)
+            plt.close()
+        else:
+            coef_cols = [c for c in df_imp.columns if c not in ("feature", "n_folds_selected")]
+            n = len(coef_cols)
+            if n == 0:
+                continue
+            fig, axes = plt.subplots(1, n, figsize=(5 * n + 1, 6))
+            if n == 1:
+                axes = [axes]
+            for ax, col in zip(axes, coef_cols):
+                top = df_imp.reindex(
+                    df_imp[col].abs().sort_values(ascending=False).index
+                ).head(15)
+                colors = ["#d62728" if v < 0 else "#1f77b4" for v in top[col].iloc[::-1]]
+                ax.barh(top["feature"].iloc[::-1], top[col].iloc[::-1], color=colors)
+                ax.axvline(0, color="k", lw=0.8)
+                ax.set_title(col, fontsize=9)
+            plt.suptitle(f"Cluster {args.cluster} — {model_name.upper()} [{label_mode}] "
+                         f"top-15 coefficients per archetype", fontsize=11)
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.outdir,
+                                     f"{model_name}_{label_mode}_feature_importance.pdf"), dpi=150)
+            plt.close()
 
     print(f"\nEvaluation saved to {args.outdir}")
 

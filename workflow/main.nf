@@ -1,44 +1,72 @@
 nextflow.enable.dsl = 2
 
-// ─── 1. Extract per-cluster pseudo-bulk features and MIL bags ────────────────
-process PREPARE_DATA {
+// ─── 0. Split the full AnnData into one lightweight AnnData per cluster ──────
+// Runs once: loads the full (potentially very large) input AnnData, derives
+// cluster_col via the celltype→cluster map (adata.obs only has celltype_col),
+// and writes one subset AnnData per cluster so PREPARE_DATA below can fan out
+// and run in parallel instead of looping over clusters in a single big job.
+process SPLIT_BY_CLUSTER {
     label 'mem_100gb'
     container params.container_ml
-    publishDir "${params.outdir}/prepared_data", mode: 'copy'
+    publishDir "${params.outdir}/split_by_cluster", mode: 'copy'
 
     input:
     path anndata
-    path archetype_scores
     path celltype_cluster_map
 
     output:
-    path "*.pseudobulk.npz", emit: pseudobulk
-    path "*.targets.csv",    emit: targets
-    path "*.mil_bags.h5",    emit: mil_bags
+    path "*.cluster_input.h5ad",      emit: cluster_adatas
+    path "full_obs_celltypes.tsv.gz", emit: full_obs
 
     script:
-    def map_arg = celltype_cluster_map.name != "NO_FILE" ? "--celltype_cluster_map ${celltype_cluster_map}" : ""
     """
-    python ${launchDir}/scripts/001_prepare_data.py \\
+    python ${launchDir}/scripts/000_split_by_cluster.py \\
         --anndata              ${anndata} \\
-        --archetype_scores     ${archetype_scores} \\
+        --celltype_cluster_map ${celltype_cluster_map} \\
         --cluster_col          "${params.cluster_col}" \\
         --sample_col           "${params.sample_col}" \\
+        --celltype_col         "${params.celltype_col}"
+    """
+}
+
+// ─── 1. Extract pseudo-bulk features and MIL bags for one cluster ────────────
+// Submitted as one job per cluster (fans out from SPLIT_BY_CLUSTER's output).
+process PREPARE_DATA {
+    label 'mem_32gb'
+    container params.container_ml
+    tag "${cluster}"
+    publishDir "${params.outdir}/prepared_data", mode: 'copy'
+
+    input:
+    tuple val(cluster), path(cluster_adata)
+    path archetype_scores
+    path full_obs_celltypes
+
+    output:
+    tuple val(cluster), path("*.pseudobulk.npz"),                 emit: pseudobulk
+    tuple val(cluster), path("*.targets.csv"),   optional: true,  emit: targets
+    tuple val(cluster), path("*.mil_bags.h5"),   optional: true,  emit: mil_bags
+
+    script:
+    """
+    python ${launchDir}/scripts/001_prepare_data.py \\
+        --anndata              ${cluster_adata} \\
+        --cluster              "${cluster}" \\
+        --archetype_scores     ${archetype_scores} \\
+        --target_mode          "${params.raw_or_clr_pca}" \\
+        --sample_col           "${params.sample_col}" \\
         --celltype_col         "${params.celltype_col}" \\
-        --rawcelltype_col      "${params.rawcelltype_col}" \\
-        --hvg_pct              ${params.hvg_pct} \\
-        --hvg_max              ${params.hvg_max} \\
         --pseudobulk_agg       "${params.pseudobulk_agg}" \\
         --min_sample_pct       ${params.min_sample_pct} \\
         --include_abundance    ${params.include_abundance} \\
         --abundance_type       "${params.abundance_type}" \\
-        ${map_arg}
+        --full_obs_celltypes   ${full_obs_celltypes}
     """
 }
 
-// ─── 2a. Train one tree model for one label mode ──────────────────────────────
+// ─── 2a. Train one tree/linear model for one label mode ──────────────────────
 // Submitted as one job per (cluster × model × label_mode).
-// 2 models × 3 label modes = 6 jobs per cluster.
+// 4 models × 1 label mode = 4 jobs per cluster (xgboost, rf, elasticnet, lasso).
 process TRAIN_TREE_MODELS {
     label 'mem_32gb'
     container params.container_ml
@@ -49,30 +77,42 @@ process TRAIN_TREE_MODELS {
     tuple val(cluster), path(pseudobulk), path(targets), val(model), val(label_mode)
     path xgb_param_grid
     path rf_param_grid
+    path elasticnet_param_grid
+    path lasso_param_grid
 
     output:
     tuple val(cluster), path("${cluster}_${model}_${label_mode}_tree/"), emit: results
 
     script:
+    // Only xgboost gets extra inner-search parallelism (it's the one hitting
+    // TERM_RUNLIMIT). This value is baked into the rendered command line, so
+    // keeping it at 1 for every other model means their already-completed
+    // -resume cache entries stay byte-identical and won't be needlessly
+    // re-run when this changes.
+    def n_jobs_inner_this = (model == 'xgboost') ? params.n_jobs_inner_xgboost : 1
     """
     mkdir -p ${cluster}_${model}_${label_mode}_tree
     python ${launchDir}/scripts/002_train_tree_models.py \\
-        --cluster        ${cluster} \\
-        --pseudobulk     ${pseudobulk} \\
-        --targets        ${targets} \\
-        --xgb_params     ${xgb_param_grid} \\
-        --rf_params      ${rf_param_grid} \\
-        --models         ${model} \\
-        --label_mode     ${label_mode} \\
-        --min_score      ${params.min_score} \\
-        --n_outer_folds  ${params.n_outer_folds} \\
-        --n_inner_folds  ${params.n_inner_folds} \\
-        --n_iter         ${params.n_hpo_iter_tree} \\
-        --seed           ${params.random_seed} \\
-        --n_jobs_outer   ${params.n_jobs_outer ?: 1} \\
-        --n_jobs_inner   ${params.n_jobs_inner ?: 1} \\
-        --n_jobs_models  1 \\
-        --outdir         ${cluster}_${model}_${label_mode}_tree
+        --cluster          ${cluster} \\
+        --pseudobulk       ${pseudobulk} \\
+        --targets          ${targets} \\
+        --xgb_params       ${xgb_param_grid} \\
+        --rf_params        ${rf_param_grid} \\
+        --elasticnet_params ${elasticnet_param_grid} \\
+        --lasso_params     ${lasso_param_grid} \\
+        --models           ${model} \\
+        --hvg_pct          ${params.hvg_pct} \\
+        --hvg_max          ${params.hvg_max} \\
+        --label_mode       ${label_mode} \\
+        --min_score        ${params.min_score} \\
+        --n_outer_folds    ${params.n_outer_folds} \\
+        --n_inner_folds    ${params.n_inner_folds} \\
+        --n_iter           ${params.n_hpo_iter_tree} \\
+        --seed             ${params.random_seed} \\
+        --n_jobs_outer     1 \\
+        --n_jobs_inner     ${n_jobs_inner_this} \\
+        --n_jobs_models    1 \\
+        --outdir           ${cluster}_${model}_${label_mode}_tree
     """
 }
 
@@ -99,6 +139,9 @@ process TRAIN_MIL {
         --mil_bags          ${mil_bags} \\
         --targets           ${targets} \\
         --mil_params        ${mil_param_grid} \\
+        --hvg_pct           ${params.hvg_pct} \\
+        --hvg_max           ${params.hvg_max} \\
+        --pseudobulk_agg    "${params.pseudobulk_agg}" \\
         --label_mode        ${label_mode} \\
         --min_score         ${params.min_score} \\
         --n_outer_folds     ${params.n_outer_folds} \\
@@ -160,21 +203,31 @@ process AGGREGATE_RESULTS {
 workflow {
 
     // Input channels
-    anndata_ch           = Channel.fromPath(params.anndata,          checkIfExists: true)
-    archetype_scores_ch  = Channel.fromPath(params.archetype_scores, checkIfExists: true)
+    anndata_ch           = Channel.fromPath(params.anndata,             checkIfExists: true)
+    celltype_map_ch      = Channel.fromPath(params.celltype_cluster_map, checkIfExists: true)
+    // Reused across every parallel PREPARE_DATA / TRAIN_TREE_MODELS job, so these
+    // must be value channels (Channel.value), not plain queue channels — otherwise
+    // they'd only be available to the first job and exhausted after that.
+    archetype_scores_ch  = Channel.value(file(params.archetype_scores, checkIfExists: true))
     xgb_params_ch        = Channel.value(file("${launchDir}/scripts/param_grids/xgboost_params.json"))
     rf_params_ch         = Channel.value(file("${launchDir}/scripts/param_grids/rf_params.json"))
+    elasticnet_params_ch = Channel.value(file("${launchDir}/scripts/param_grids/elasticnet_params.json"))
+    lasso_params_ch      = Channel.value(file("${launchDir}/scripts/param_grids/lasso_params.json"))
     mil_params_ch        = Channel.value(file("${launchDir}/scripts/param_grids/mil_params.json"))
-
-    // Celltype→cluster map is optional; pass a sentinel file when not set
-    celltype_map_ch = (params.celltype_cluster_map && params.celltype_cluster_map != "")
-        ? Channel.fromPath(params.celltype_cluster_map, checkIfExists: true)
-        : Channel.fromPath("NO_FILE", checkIfExists: false).ifEmpty(file("NO_FILE"))
 
     // Build model and label_mode lists from config flags
     def model_list = []
-    if (params.run_xgboost == "true") model_list << "xgboost"
-    if (params.run_rf      == "true") model_list << "rf"
+    if (params.run_xgboost    == "true") model_list << "xgboost"
+    if (params.run_rf         == "true") model_list << "rf"
+    if (params.run_elasticnet == "true") model_list << "elasticnet"
+    if (params.run_lasso      == "true") model_list << "lasso"
+    // Independent single-output ElasticNet/Lasso per target (no shared feature
+    // support), only meaningful to compare against the joint fits when targets
+    // are the orthogonal PCA archetype scores.
+    if (params.raw_or_clr_pca == "pca" && params.run_independent_pca_fits == "true") {
+        if (params.run_elasticnet == "true") model_list << "elasticnet_indep"
+        if (params.run_lasso      == "true") model_list << "lasso_indep"
+    }
     models_ch = Channel.fromList(model_list)
 
     def label_mode_list = []
@@ -183,21 +236,25 @@ workflow {
     if (params.run_label_argmax_filtered == "true") label_mode_list << "argmax_filtered"
     label_modes_ch = Channel.fromList(label_mode_list)
 
-    // Step 1: Prepare features — runs once, outputs one file set per cluster
-    PREPARE_DATA(anndata_ch, archetype_scores_ch, celltype_map_ch)
+    // Step 0: Split the full AnnData into one lightweight per-cluster AnnData —
+    // runs once, so PREPARE_DATA below can fan out and run in parallel per cluster.
+    SPLIT_BY_CLUSTER(anndata_ch, celltype_map_ch)
 
-    // Fan out per cluster: derive cluster key from filename prefix (e.g. "A" from A_pseudobulk.npz)
+    // Fan out per cluster: derive cluster key from filename prefix (e.g. "A" from A.cluster_input.h5ad)
+    cluster_adata_ch = SPLIT_BY_CLUSTER.out.cluster_adatas
+        .flatten()
+        .map { f -> [f.simpleName, f] }
+
+    // SPLIT_BY_CLUSTER runs once but its full_obs output is needed by every
+    // parallel PREPARE_DATA job below — .first() converts it to a value channel.
+    full_obs_ch = SPLIT_BY_CLUSTER.out.full_obs.first()
+
+    // Step 1: Prepare features — one parallel job per cluster
+    PREPARE_DATA(cluster_adata_ch, archetype_scores_ch, full_obs_ch)
+
     pseudobulk_ch = PREPARE_DATA.out.pseudobulk
-        .flatten()
-        .map { f -> [f.simpleName.replaceAll('_pseudobulk', ''), f] }
-
-    targets_ch = PREPARE_DATA.out.targets
-        .flatten()
-        .map { f -> [f.simpleName.replaceAll('_targets', ''), f] }
-
-    mil_bags_ch = PREPARE_DATA.out.mil_bags
-        .flatten()
-        .map { f -> [f.simpleName.replaceAll('_mil_bags', ''), f] }
+    targets_ch    = PREPARE_DATA.out.targets
+    mil_bags_ch   = PREPARE_DATA.out.mil_bags
 
     // Step 2a: Tree models — fan out to one job per (cluster × model × label_mode)
     tree_input_ch = pseudobulk_ch
@@ -205,7 +262,7 @@ workflow {
         .combine(models_ch)
         .combine(label_modes_ch)
     // tree_input_ch: [cluster, pseudobulk, targets, model, label_mode]
-    TRAIN_TREE_MODELS(tree_input_ch, xgb_params_ch, rf_params_ch)
+    TRAIN_TREE_MODELS(tree_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch)
 
     // Collect all tree result dirs for the same cluster into a list
     tree_results_ch = TRAIN_TREE_MODELS.out.results.groupTuple()

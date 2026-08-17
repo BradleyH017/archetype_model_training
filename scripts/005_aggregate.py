@@ -4,8 +4,19 @@
 Aggregate per-cluster evaluation results across all clusters.
 
 Outputs (in --outdir):
-  all_clusters_metrics.csv     — full long-format metrics table
-  model_summary.csv            — mean R² / RMSE per model
+  all_clusters_metrics.csv         — full long-format metrics table
+  model_summary.csv                — mean R² / RMSE per model, pooling every
+                                      individual archetype/PC row uniformly
+                                      (naive — a cluster with more targets
+                                      counts more; see model_summary_overall.csv)
+  all_clusters_overall_metrics.csv — one row per (cluster × model × label_mode):
+                                      multivariate (variance-weighted) R² and
+                                      aggregate RMSE across that cluster's targets
+  model_summary_overall.csv        — per model, r2_variance_weighted/rmse_aggregate
+                                      averaged ACROSS CLUSTERS (each cluster
+                                      contributes one number, regardless of how
+                                      many targets it has) — a more principled
+                                      ranking than model_summary.csv's flat pooling
   {model}_r2_heatmap.pdf       — R² heatmap: clusters × archetypes
   model_r2_boxplot.pdf         — R² distribution per model
   model_r2_stripplot.pdf       — all data points, faceted by cluster
@@ -68,6 +79,34 @@ def main():
     summary.to_csv(os.path.join(args.outdir, "model_summary.csv"), index=False)
     print("\nModel summary:")
     print(summary.to_string(index=False))
+
+    # ── Overall (multivariate, variance-weighted) per-cluster metrics ─────────
+    overall_dfs = []
+    for d in args.eval_dirs:
+        f = os.path.join(d, "combined_overall_metrics.csv")
+        if os.path.exists(f):
+            overall_dfs.append(pd.read_csv(f))
+    if overall_dfs:
+        df_overall = pd.concat(overall_dfs, ignore_index=True)
+        df_overall.to_csv(os.path.join(args.outdir, "all_clusters_overall_metrics.csv"), index=False)
+        print(f"\nLoaded {len(df_overall)} overall-metric rows from {len(overall_dfs)} clusters.")
+
+        # Each row here is already one whole-cluster aggregate (not a per-target
+        # row), so a plain mean across rows correctly averages "per cluster",
+        # not "per archetype" — unlike model_summary.csv above.
+        summary_overall = (df_overall.groupby("model")
+                              .agg(
+                                  r2_variance_weighted_mean = ("r2_variance_weighted", "mean"),
+                                  r2_variance_weighted_std  = ("r2_variance_weighted", "std"),
+                                  rmse_aggregate_mean       = ("rmse_aggregate", "mean"),
+                                  rmse_aggregate_std        = ("rmse_aggregate", "std"),
+                                  n_clusters                = ("cluster", "count"),
+                              )
+                              .reset_index()
+                              .sort_values("r2_variance_weighted_mean", ascending=False))
+        summary_overall.to_csv(os.path.join(args.outdir, "model_summary_overall.csv"), index=False)
+        print("\nModel summary (overall, variance-weighted, averaged across clusters):")
+        print(summary_overall.to_string(index=False))
 
     models = df["model"].unique()
 
