@@ -14,6 +14,30 @@ feature support across targets — to compare against the joint fits above.
 This matters because PCA targets are orthogonal by construction, which
 weakens the multi-task assumption that targets share a common feature set.
 
+XGBoost has the same indep/joint split, via two distinct model names rather
+than a flag, since they need different XGBoost versions:
+  "xgboost_indep"  — one independent single-output XGBRegressor per target,
+                      via sklearn's MultiOutputRegressor. This was the
+                      pipeline's original (and, until now, only) "xgboost"
+                      behavior; renamed to make the independence explicit and
+                      consistent with elasticnet_indep/lasso_indep. Its
+                      feature_importances_ is a single vector averaged across
+                      the per-target estimators_, but each target's own fitted
+                      model is still a normal single-output XGBRegressor, so
+                      SHAP/TreeExplainer works per archetype if computed
+                      directly against those individual estimators.
+  "xgboost_joint"  — XGBoost's native multi_strategy="multi_output_tree"
+                      (requires XGBoost>=2.0): one shared ensemble of trees
+                      per cluster, each leaf holding a vector across all
+                      archetype targets. Typically run in a separate
+                      environment/container with a matching XGBoost version
+                      (params.xgboost2_env in the Nextflow workflow, since
+                      container_ml's pinned XGBoost predates this feature).
+                      Unlike xgboost_indep, feature_importances_ here is
+                      genuinely a single vector shared across all targets
+                      (not per-archetype) — same as rf — and upstream does
+                      not yet support Tree SHAP for this strategy at all.
+
 HVGs are reselected independently for each outer CV fold, from that fold's
 training samples only (--hvg_pct/--hvg_max here, not in 001_prepare_data.py)
 — see helpers.select_hvgs / _fit_outer_fold. This avoids ranking genes by
@@ -42,6 +66,14 @@ Label modes (--label_mode):
   full            — all continuous archetype weights (default, original behaviour)
   argmax          — full cohort, targets converted to one-hot at dominant archetype
   argmax_filtered — cohort filtered to max archetype weight > --min_score, then one-hot
+
+Technical covariate regression (--meta_file / --train_only_covs / --train_test_covs):
+  Optional. Removes technical-covariate effects from the pseudobulk features
+  BEFORE HVG selection, fit fresh per outer fold on that fold's training
+  samples only — see helpers.regress_out_covariates and the section 2b module
+  comment in helpers.py for the train_only_covs vs train_test_covs
+  distinction (whether the fitted adjustment is also applied to the held-out
+  fold, vs. train-only and discarded). Both default to empty (no adjustment).
 """
 # TESTING: module load HGI/softpack/users/eh19/BioAUTOMATED/1
 # module load cuda-12.1.1
@@ -60,11 +92,14 @@ from helpers import (
     apply_label_mode,
     build_estimator,
     combine_fold_importances,
+    load_meta_file,
     load_pseudobulk,
     overall_metrics,
     per_archetype_metrics,
     run_nested_cv_tree,
     run_nested_cv_independent,
+    split_covariate_names,
+    validate_covariate_lists,
 )
 
 
@@ -77,7 +112,7 @@ def parse_args():
     p.add_argument("--rf_params",        required=True)
     p.add_argument("--elasticnet_params", required=True)
     p.add_argument("--lasso_params",     required=True)
-    p.add_argument("--models",           nargs="+", default=["xgboost", "rf"])
+    p.add_argument("--models",           nargs="+", default=["xgboost_indep", "rf"])
     p.add_argument("--hvg_pct",          type=float, default=0.20,
                    help="Per-outer-fold HVG selection: fraction of candidate genes to keep")
     p.add_argument("--hvg_max",          type=int,   default=2000,
@@ -107,6 +142,20 @@ def parse_args():
                         "restrict to samples where max weight > --min_score")
     p.add_argument("--min_score",        type=float, default=0.5,
                    help="Minimum dominant archetype weight for argmax_filtered mode")
+    p.add_argument("--meta_file",        default=None,
+                   help="Per-sample metadata CSV (first column = sample ID, matching "
+                        "--sample_col elsewhere in the pipeline). Required if either "
+                        "--train_only_covs or --train_test_covs is non-empty.")
+    p.add_argument("--train_only_covs",  nargs="*", default=[],
+                   help="Covariate column(s) in --meta_file to regress out of the "
+                        "TRAINING fold only (not applied to the held-out fold) — for "
+                        "covariates unmeasurable/inapplicable in external data, e.g. a "
+                        "batch/pooling identifier. See helpers.regress_out_covariates.")
+    p.add_argument("--train_test_covs",  nargs="*", default=[],
+                   help="Covariate column(s) in --meta_file to regress out of both the "
+                        "training AND held-out fold (fit on train, applied to test) — "
+                        "for covariates measurable identically in any dataset, e.g. "
+                        "total_counts/n_genes_expressed. See helpers.regress_out_covariates.")
 
     # ── Interactive testing ───────────────────────────────────────────────────
     # Uncomment the block below and swap `return p.parse_args()` → `return args`
@@ -119,7 +168,7 @@ def parse_args():
          rf_params       = "scripts/param_grids/rf_params.json",
          elasticnet_params = "scripts/param_grids/elasticnet_params.json",
          lasso_params    = "scripts/param_grids/lasso_params.json",
-         models          = ["xgboost"],        # one model per job; swap to ["xgboost"] as needed
+         models          = ["xgboost_indep"],  # one model per job; swap as needed
          hvg_pct         = 0.20,
          hvg_max         = 2000,
          n_outer_folds   = 5,
@@ -134,6 +183,9 @@ def parse_args():
          device          = "cpu",
          label_mode      = "argmax_filtered",
          min_score       = 0.5,
+         meta_file       = None,
+         train_only_covs = [],
+         train_test_covs = [],
     )
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -141,17 +193,20 @@ def parse_args():
 
 
 def _run_one_model(model_name, args, estimator_n_jobs, X, y, arch_cols, samples, feature_names,
-                    n_gene_features):
+                    n_gene_features, df_meta):
     """Train a single model with nested CV and return its results."""
     param_path = {
-        "xgboost":          args.xgb_params,
+        "xgboost_indep":    args.xgb_params,
+        "xgboost_joint":    args.xgb_params,
         "rf":               args.rf_params,
         "elasticnet":       args.elasticnet_params,
         "lasso":            args.lasso_params,
         "elasticnet_indep": args.elasticnet_params,
         "lasso_indep":      args.lasso_params,
     }[model_name]
-    device     = args.device if model_name == "xgboost" else "cpu"
+    # xgboost_joint always runs CPU/hist regardless of --device — see
+    # build_estimator's comment on why GPU isn't wired up for multi_output_tree.
+    device     = args.device if model_name == "xgboost_indep" else "cpu"
     base, grid = build_estimator(model_name, param_path, args.seed,
                                  n_jobs=estimator_n_jobs, device=device)
     print(f"\n{'='*40}\n{model_name.upper()}", flush=True)
@@ -163,6 +218,8 @@ def _run_one_model(model_name, args, estimator_n_jobs, X, y, arch_cols, samples,
             n_jobs_outer=args.n_jobs_outer,
             n_jobs_inner=args.n_jobs_inner,
             n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
+            samples=samples, covariate_df=df_meta,
+            train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
         )
     else:
         fold_metrics, oof_preds, all_imps = run_nested_cv_tree(
@@ -172,12 +229,16 @@ def _run_one_model(model_name, args, estimator_n_jobs, X, y, arch_cols, samples,
             n_jobs_outer=args.n_jobs_outer,
             n_jobs_inner=args.n_jobs_inner,
             n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
+            samples=samples, covariate_df=df_meta,
+            train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
         )
     return model_name, fold_metrics, oof_preds, all_imps
 
 
 def main():
     args = parse_args()
+    args.train_only_covs = split_covariate_names(args.train_only_covs)
+    args.train_test_covs = split_covariate_names(args.train_test_covs)
     os.makedirs(args.outdir, exist_ok=True)
 
     # Auto-set estimator n_jobs: use 1 when outer/inner parallelism is active to
@@ -202,6 +263,21 @@ def main():
     y = df_tgt.loc[samples].values.astype(float)
     arch_cols = df_tgt.columns.tolist()
 
+    df_meta = None
+    if args.train_only_covs or args.train_test_covs:
+        if not args.meta_file:
+            raise ValueError("--train_only_covs/--train_test_covs given but --meta_file is not set")
+        print(f"Loading covariate metadata from {args.meta_file}")
+        df_meta = load_meta_file(args.meta_file)
+        validate_covariate_lists(df_meta, args.train_only_covs, args.train_test_covs)
+        keep_idx = [i for i, s in enumerate(samples) if s in df_meta.index]
+        if len(keep_idx) < len(samples):
+            print(f"  Dropping {len(samples) - len(keep_idx)} samples not in meta_file")
+        X       = X[keep_idx]
+        samples = [samples[i] for i in keep_idx]
+        y       = y[keep_idx]
+        print(f"  train_only_covs={args.train_only_covs}  train_test_covs={args.train_test_covs}")
+
     y, keep_mask = apply_label_mode(y, args.label_mode, args.min_score)
     if not keep_mask.all():
         n_kept = keep_mask.sum()
@@ -222,7 +298,7 @@ def main():
     model_results = Parallel(n_jobs=n_jobs_models, prefer="processes")(
         delayed(_run_one_model)(
             model_name, args, estimator_n_jobs, X, y, arch_cols, samples, feature_names,
-            n_gene_features,
+            n_gene_features, df_meta,
         )
         for model_name in args.models
     )

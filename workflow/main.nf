@@ -65,8 +65,10 @@ process PREPARE_DATA {
 }
 
 // ─── 2a. Train one tree/linear model for one label mode ──────────────────────
-// Submitted as one job per (cluster × model × label_mode).
-// 4 models × 1 label mode = 4 jobs per cluster (xgboost, rf, elasticnet, lasso).
+// Submitted as one job per (cluster × model × label_mode): xgboost_indep, rf,
+// elasticnet, lasso — plus elasticnet_indep/lasso_indep when enabled.
+// xgboost_joint runs separately (different XGBoost version) — see
+// TRAIN_XGBOOST_JOINT below.
 process TRAIN_TREE_MODELS {
     label 'mem_32gb'
     container params.container_ml
@@ -79,6 +81,7 @@ process TRAIN_TREE_MODELS {
     path rf_param_grid
     path elasticnet_param_grid
     path lasso_param_grid
+    path meta_file
 
     output:
     tuple val(cluster), path("${cluster}_${model}_${label_mode}_tree/"), emit: results
@@ -90,12 +93,15 @@ process TRAIN_TREE_MODELS {
     tuple val(cluster), val(model), val(label_mode), path("${cluster}_${model}_${label_mode}_tree/"), emit: results_tagged
 
     script:
-    // Only xgboost gets extra inner-search parallelism (it's the one hitting
-    // TERM_RUNLIMIT). This value is baked into the rendered command line, so
-    // keeping it at 1 for every other model means their already-completed
-    // -resume cache entries stay byte-identical and won't be needlessly
-    // re-run when this changes.
-    def n_jobs_inner_this = (model == 'xgboost') ? params.n_jobs_inner_xgboost : 1
+    // Only xgboost_indep gets extra inner-search parallelism (it's the one
+    // hitting TERM_RUNLIMIT). This value is baked into the rendered command
+    // line, so keeping it at 1 for every other model means their
+    // already-completed -resume cache entries stay byte-identical and won't
+    // be needlessly re-run when this changes.
+    def n_jobs_inner_this = (model == 'xgboost_indep') ? params.n_jobs_inner_xgboost : 1
+    // meta_file is optional (sentinel "NO_FILE" when unset) — omit --meta_file
+    // entirely rather than pass a nonexistent path through to argparse.
+    def meta_arg = meta_file.name != "NO_FILE" ? "--meta_file ${meta_file}" : ""
     """
     mkdir -p ${cluster}_${model}_${label_mode}_tree
     python ${launchDir}/scripts/002_train_tree_models.py \\
@@ -118,7 +124,64 @@ process TRAIN_TREE_MODELS {
         --n_jobs_outer     1 \\
         --n_jobs_inner     ${n_jobs_inner_this} \\
         --n_jobs_models    1 \\
+        ${meta_arg} \\
+        --train_only_covs  ${params.train_only_covs} \\
+        --train_test_covs  ${params.train_test_covs} \\
         --outdir           ${cluster}_${model}_${label_mode}_tree
+    """
+}
+
+// ─── 2a-joint. XGBoost native joint multi-output fit ──────────────────────────
+// Separate process (and container) from TRAIN_TREE_MODELS: multi_strategy=
+// "multi_output_tree" requires XGBoost>=2.0, and container_ml's pinned
+// XGBoost predates it (see helpers.build_estimator's version check). Point
+// params.xgboost2_env at an environment with a current XGBoost to use this.
+// Guarded by params.run_xgboost_joint (off by default) — see workflow below.
+process TRAIN_XGBOOST_JOINT {
+    label 'mem_32gb'
+    container params.xgboost2_env
+    tag "xgboost_joint_${cluster}_${label_mode}"
+    publishDir "${params.outdir}/tree_models/${cluster}/xgboost_joint/${label_mode}", mode: 'copy'
+
+    input:
+    tuple val(cluster), path(pseudobulk), path(targets), val(label_mode)
+    path xgb_param_grid
+    path rf_param_grid
+    path elasticnet_param_grid
+    path lasso_param_grid
+    path meta_file
+
+    output:
+    tuple val(cluster), path("${cluster}_xgboost_joint_${label_mode}_tree/"), emit: results
+
+    script:
+    def meta_arg = meta_file.name != "NO_FILE" ? "--meta_file ${meta_file}" : ""
+    """
+    mkdir -p ${cluster}_xgboost_joint_${label_mode}_tree
+    python ${launchDir}/scripts/002_train_tree_models.py \\
+        --cluster          ${cluster} \\
+        --pseudobulk       ${pseudobulk} \\
+        --targets          ${targets} \\
+        --xgb_params       ${xgb_param_grid} \\
+        --rf_params        ${rf_param_grid} \\
+        --elasticnet_params ${elasticnet_param_grid} \\
+        --lasso_params     ${lasso_param_grid} \\
+        --models           xgboost_joint \\
+        --hvg_pct          ${params.hvg_pct} \\
+        --hvg_max          ${params.hvg_max} \\
+        --label_mode       ${label_mode} \\
+        --min_score        ${params.min_score} \\
+        --n_outer_folds    ${params.n_outer_folds} \\
+        --n_inner_folds    ${params.n_inner_folds} \\
+        --n_iter           ${params.n_hpo_iter_tree} \\
+        --seed             ${params.random_seed} \\
+        --n_jobs_outer     1 \\
+        --n_jobs_inner     ${params.n_jobs_inner_xgboost} \\
+        ${meta_arg} \\
+        --train_only_covs  ${params.train_only_covs} \\
+        --train_test_covs  ${params.train_test_covs} \\
+        --n_jobs_models    1 \\
+        --outdir           ${cluster}_xgboost_joint_${label_mode}_tree
     """
 }
 
@@ -141,11 +204,13 @@ process PERMUTATION_NULL {
     path rf_param_grid
     path elasticnet_param_grid
     path lasso_param_grid
+    path meta_file
 
     output:
     tuple val(cluster), path("*_permutation_summary.csv"), path("*_permutation_null_raw.csv"), emit: results
 
     script:
+    def meta_arg = meta_file.name != "NO_FILE" ? "--meta_file ${meta_file}" : ""
     """
     python ${launchDir}/scripts/007_permutation_null.py \\
         --cluster        ${cluster} \\
@@ -164,6 +229,9 @@ process PERMUTATION_NULL {
         --label_mode     ${label_mode} \\
         --min_score      ${params.min_score} \\
         --seed           ${params.random_seed} \\
+        ${meta_arg} \\
+        --train_only_covs ${params.train_only_covs} \\
+        --train_test_covs ${params.train_test_covs} \\
         --outdir         .
     """
 }
@@ -268,9 +336,22 @@ workflow {
     lasso_params_ch      = Channel.value(file("${launchDir}/scripts/param_grids/lasso_params.json"))
     mil_params_ch        = Channel.value(file("${launchDir}/scripts/param_grids/mil_params.json"))
 
+    // Per-sample metadata for technical covariate regression is optional; pass
+    // a sentinel file when not set (params.train_only_covs/train_test_covs are
+    // both empty by default, so this is a no-op unless you actually list covariates).
+    // Reused across many TRAIN_TREE_MODELS/TRAIN_XGBOOST_JOINT/PERMUTATION_NULL
+    // tasks, so this must be a single value channel regardless of branch.
+    def meta_file_path = (params.meta_file && params.meta_file != "")
+        ? file(params.meta_file, checkIfExists: true)
+        : file("NO_FILE")
+    meta_file_ch = Channel.value(meta_file_path)
+
     // Build model and label_mode lists from config flags
+    // xgboost_joint is NOT added here — it needs a different container
+    // (params.xgboost2_env) so it runs through its own dedicated process,
+    // TRAIN_XGBOOST_JOINT, guarded by params.run_xgboost_joint below.
     def model_list = []
-    if (params.run_xgboost    == "true") model_list << "xgboost"
+    if (params.run_xgboost    == "true") model_list << "xgboost_indep"
     if (params.run_rf         == "true") model_list << "rf"
     if (params.run_elasticnet == "true") model_list << "elasticnet"
     if (params.run_lasso      == "true") model_list << "lasso"
@@ -315,18 +396,42 @@ workflow {
         .combine(models_ch)
         .combine(label_modes_ch)
     // tree_input_ch: [cluster, pseudobulk, targets, model, label_mode]
-    TRAIN_TREE_MODELS(tree_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch)
+    TRAIN_TREE_MODELS(tree_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch, meta_file_ch)
+
+    // xgboost_joint (multi_strategy="multi_output_tree", XGBoost>=2.0) runs in
+    // its own process/container (params.xgboost2_env) rather than through
+    // TRAIN_TREE_MODELS/model_list above, since container_ml's pinned
+    // XGBoost predates this feature — see TRAIN_XGBOOST_JOINT.
+    all_tree_results_ch = TRAIN_TREE_MODELS.out.results
+    if (params.run_xgboost_joint == "true") {
+        xgb_joint_input_ch = pseudobulk_ch
+            .join(targets_ch)
+            .combine(label_modes_ch)
+        // xgb_joint_input_ch: [cluster, pseudobulk, targets, label_mode]
+        TRAIN_XGBOOST_JOINT(xgb_joint_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch, meta_file_ch)
+        all_tree_results_ch = all_tree_results_ch.mix(TRAIN_XGBOOST_JOINT.out.results)
+    }
 
     // Collect all tree result dirs for the same cluster into a list
-    tree_results_ch = TRAIN_TREE_MODELS.out.results.groupTuple()
-    // tree_results_ch: [cluster, [dir_xgboost_full, dir_xgboost_argmax, ..., dir_rf_argmax_filtered]]
+    tree_results_ch = all_tree_results_ch.groupTuple()
+    // tree_results_ch: [cluster, [dir_xgboost_indep_full, ..., dir_rf_full, dir_xgboost_joint_full (if enabled)]]
 
-    // Step 2a-null: per-PC permutation null test, ElasticNet/Lasso family only —
-    // fixes hyperparameters from each job's own {model}_fold_metrics.csv (no new
-    // search), so it's cheap enough to run automatically for every one of these
-    // models/clusters before you've picked a winner, feeding into EVALUATE_MODELS
-    // below rather than being a manual follow-up on a single chosen model.
-    def NULL_TEST_MODELS = ['elasticnet', 'lasso', 'elasticnet_indep', 'lasso_indep']
+    // Step 2a-null: per-PC permutation null test — fixes hyperparameters from
+    // each job's own {model}_fold_metrics.csv (no new search), so it's cheap
+    // enough to run automatically for every one of these models/clusters
+    // before you've picked a winner, feeding into EVALUATE_MODELS below
+    // rather than being a manual follow-up on a single chosen model.
+    // xgboost_indep included: its hyperparameter search is joint (single
+    // shared setting, parsed the same way as elasticnet/lasso) but its
+    // fitting is always independent per target regardless — see
+    // 007_permutation_null.py's module docstring and _PER_TARGET_FIT_MODELS.
+    // rf/mil are not included — rf is natively, genuinely joint (nothing to
+    // work around), and MIL needs a different approach entirely. xgboost_joint
+    // is also not included: it's natively joint the same way rf is, but this
+    // process runs in container_ml, which doesn't have the XGBoost>=2.0 that
+    // xgboost_joint requires (see TRAIN_XGBOOST_JOINT) — wiring a second
+    // container-specific permutation-null process wasn't asked for here.
+    def NULL_TEST_MODELS = ['elasticnet', 'lasso', 'elasticnet_indep', 'lasso_indep', 'xgboost_indep']
     // Up to 4 models share the same cluster key here. Nextflow's join() silently
     // drops all but the first match when a key repeats on one side (see
     // https://github.com/nextflow-io/nextflow/issues/654) — with 4
@@ -345,7 +450,7 @@ workflow {
             [cluster, dir, model, label_mode, pbMap[cluster], tgtMap[cluster]]
         }
     // perm_null_input_ch: [cluster, tree_dir, model, label_mode, pseudobulk, targets]
-    PERMUTATION_NULL(perm_null_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch)
+    PERMUTATION_NULL(perm_null_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch, meta_file_ch)
 
     // Only thread the summary CSV into EVALUATE_MODELS (the raw per-permutation
     // draws stay published under results/permutation_null/ for direct inspection

@@ -46,3 +46,30 @@ load_model_files = function(resdir, permute_dir){
         permute = permute
     ))
 }
+
+#' Per-PC variance of the TRUE archetype target values, computed on the fly
+#'
+#' This is exactly the per-column weight sklearn's
+#' r2_score(multioutput='variance_weighted') uses internally (np.var(y_true,
+#' axis=0)) — it is NOT read from any stored/precomputed PCA eigenvalue
+#' (e.g. nothing from archetypal_analysis_from_mrvi's clr_pca_loadings files),
+#' it is recomputed directly from each cluster's own targets.csv every time.
+#'
+#' @param prepared_data_dir Path to results/prepared_data/ (has {cluster}.targets.csv)
+#' @param clusters Character vector of cluster labels to load
+#' @return data.frame with columns: cluster, archetype, variance
+get_pc_variance = function(prepared_data_dir, clusters){
+    lapply(clusters, function(cl){
+        f = file.path(prepared_data_dir, paste0(cl, ".targets.csv"))
+        if (!file.exists(f)) {
+            warning(sprintf("targets file not found: %s", f))
+            return(data.frame())
+        }
+        df = read.csv(f, row.names = 1)
+        data.frame(
+            cluster   = cl,
+            archetype = colnames(df),
+            variance  = sapply(df, var, use = "complete.obs")
+        )
+    }) %>% bind_rows()
+}

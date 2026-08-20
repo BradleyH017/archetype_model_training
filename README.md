@@ -91,11 +91,21 @@ Note this step does **not** select HVGs — see step 2/3 below for why, and wher
 
 Runs nested cross-validation (default 5 outer × 5 inner folds) for XGBoost, Random Forest, and the joint multi-task ElasticNet/Lasso (`MultiTaskElasticNet`/`MultiTaskLasso` — one shared feature support across all of a cluster's archetype targets). Hyperparameters are searched with `RandomizedSearchCV` (50 iterations per outer fold). `StandardScaler` is fitted on the training split only.
 
+XGBoost itself comes in two variants, run as genuinely different model names rather than a flag, because they need different XGBoost versions:
+- `xgboost_indep` (`run_xgboost`) — one independent single-output `XGBRegressor` per archetype target, via sklearn's `MultiOutputRegressor`. This is the pipeline's original XGBoost behavior.
+- `xgboost_joint` (`run_xgboost_joint`, off by default) — XGBoost's native `multi_strategy="multi_output_tree"` (requires XGBoost≥2.0): one shared ensemble of trees per cluster, each leaf holding a vector across all archetype targets — the direct XGBoost analogue of the joint `MultiTaskElasticNet`/`MultiTaskLasso` fits above. It runs through a separate Nextflow process/container (`params.xgboost2_env`), since `container_ml`'s pinned XGBoost predates `multi_strategy`. It's still upstream-experimental: no Tree SHAP support at all, and `feature_importances_` collapses to a single vector shared across all targets (like `rf`) rather than per-archetype.
+
 Hyperparameter search and per-fold R² use `multioutput='variance_weighted'` scoring, not `'uniform_average'`: each target column's contribution is weighted by its own variance rather than averaged uniformly across columns. For CLR-PCA targets this is equivalent to a genuine multivariate R² based on total squared Euclidean (Aitchison) distance, since CLR→PCA preserves distance — a model that nails a high-variance PC now correctly counts for more than one that only does well on a near-zero-variance PC.
 
 **HVGs are reselected independently for each outer CV fold**, from that fold's training samples only (`hvg_pct`/`hvg_max`, consumed here rather than in step 1). Ranking genes by variance across *all* samples before any train/test split exists — including future test-fold samples — is a mild but real data leak; computing it per fold avoids that, at the cost of each fold potentially keeping a different gene panel (feature importances are combined across folds accordingly — see `n_folds_selected` below).
 
 When `raw_or_clr_pca == "pca"` and `run_independent_pca_fits` is enabled, two extra models (`elasticnet_indep`, `lasso_indep`) also run: independent single-output ElasticNet/Lasso fit separately per archetype target, with no shared feature support. This exists because PCA targets are orthogonal by construction, which weakens the multi-task assumption that all targets share a common predictive feature set — comparing the joint vs. independent fits' OOF R² lets you check empirically whether that assumption holds for this data.
+
+**Technical covariate regression** (`meta_file` / `train_only_covs` / `train_test_covs`, all optional, off by default): removes technical-covariate effects from the pseudobulk features — not the per-cell MIL bags — before HVG selection, since HVG selection ranks genes by raw variance and a covariate-driven variance inflation can otherwise crowd biologically informative genes out of the panel. Fit fresh per outer fold, on that fold's training samples only (categorical covariate columns are one-hot encoded, continuous ones passed through; see `helpers.fit_covariate_design`). The two covariate lists get different treatment across the train/test boundary:
+- `train_only_covs` — regressed out of the training fold only; the held-out fold is left untouched, and the fit is discarded. For covariates specific to this dataset's own processing that are unmeasurable or inapplicable for genuinely external data (e.g. a batch/pooling identifier) — adjusting the held-out fold too would assume a correction capability you won't have at deployment, inflating the OOF estimate.
+- `train_test_covs` — fit on the training fold, then the same fitted adjustment is applied to the held-out fold too (standard fit-on-train/apply-to-test, like `StandardScaler`). For covariates measurable identically in any dataset (e.g. `total_counts`/`n_genes_expressed`). This one is also persisted in `006_finalize_model.py`'s bundle (`covariate_model`) for reapplication to genuinely new external samples at scoring time.
+
+`meta_file` is a per-sample metadata CSV (first column = sample ID, matching `sample_col`); required only if either covariate list is non-empty. See `helpers.regress_out_covariates` for the full implementation.
 
 **Outputs** under `{cluster}_tree/`:
 
@@ -107,9 +117,11 @@ When `raw_or_clr_pca == "pca"` and `run_independent_pca_fits` is enabled, two ex
 | `{model}_summary_metrics.csv` | Per-archetype OOF R² and RMSE |
 | `{model}_overall_metrics.csv` | One aggregate row: multivariate (variance-weighted) R² and aggregate RMSE across ALL of the cluster's targets at once |
 
+**What "importance" actually means differs by model family.** For `elasticnet`/`lasso` (and their `_indep` variants) it's the fitted regression coefficient — signed, additive, and a rigorous per-feature effect size with no caveats beyond the usual ones for penalized linear models. For `xgboost_indep`/`xgboost_joint`/`rf` it's each model's **native, built-in importance** — Mean Decrease in Impurity for RF, gain for XGBoost (`best.feature_importances_` in `helpers._fit_outer_fold`) — **not SHAP**. These native importances are cheap (computed automatically during training, no extra pass) but have well-known biases: they favor high-cardinality/continuous features (more candidate split points inflates apparent importance) and split "credit" somewhat arbitrarily among correlated features rather than attributing it fairly. If RF/XGBoost's gene rankings matter for a real conclusion, treat them as a rough guide rather than a rigorous effect size — TreeSHAP (exact and reasonably cheap for tree ensembles specifically, unlike the much more expensive KernelSHAP needed for arbitrary models) would be the natural upgrade if more rigor is needed here — though note this is currently only possible for `xgboost_indep` (each per-target `estimators_[j]` is a normal single-output tree model); upstream does not yet support Tree SHAP for `xgboost_joint`'s vector-leaf trees at all, and `rf`/`xgboost_joint`'s `feature_importances_` is a single vector shared across all targets, not per-archetype, unlike `xgboost_indep`'s per-target `estimators_`.
+
 ### 2a · Permutation null test (`007_permutation_null.py`)
 
-Runs automatically for the ElasticNet/Lasso family only (`elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep` — not xgboost/rf/mil), right after step 2, one job per (cluster × model × label_mode). Answers a more targeted question than "is this R² impressive": *does this specific model, with the hyperparameters its own nested CV actually settled on, explain more variance in each archetype PC than you'd get by chance?*
+Runs automatically for the ElasticNet/Lasso family (`elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep`) and `xgboost_indep` — not `xgboost_joint`/`rf`/`mil` — right after step 2, one job per (cluster × model × label_mode). Answers a more targeted question than "is this R² impressive": *does this specific model, with the hyperparameters its own nested CV actually settled on, explain more variance in each archetype PC than you'd get by chance?*
 
 Hyperparameters are **not re-searched** — they're fixed to the mode (most common choice) across that model's own `{model}_fold_metrics.csv` rows from step 2, so each permutation is just one plain (non-nested) K-fold CV pass with no inner `RandomizedSearchCV` loop. That's what makes it cheap enough to run automatically for every model before you've picked a winner, rather than only against a single already-chosen one — this script has no dependency on `006_finalize_model.py`.
 
@@ -145,7 +157,7 @@ Combines metrics from all models for a single cluster and generates:
 
 - `combined_metrics.csv` — all models × archetypes
 - `combined_overall_metrics.csv` — one row per (model × label_mode): multivariate (variance-weighted) R² and aggregate RMSE
-- `combined_permutation_null.csv` — ElasticNet/Lasso family only: observed R², null distribution stats, and p-value per archetype (see step 2a) — absent/empty if none of those models succeeded for this cluster
+- `combined_permutation_null.csv` — ElasticNet/Lasso family + `xgboost_indep` only (see step 2a): observed R², null distribution stats, and p-value per archetype — absent/empty if none of those models succeeded for this cluster
 - `model_comparison_bars.pdf` — R² and RMSE bar charts by archetype
 - `{model}_oof_scatter.pdf` — true vs predicted scatter per archetype
 - `{model}_feature_importance.pdf` — top-30 features (tree models)
@@ -158,7 +170,7 @@ Collects evaluation outputs across all clusters and generates:
 - `model_summary.csv` — mean / median / std R² and RMSE per model, pooled uniformly across every individual archetype/PC row (a cluster with more targets counts more)
 - `all_clusters_overall_metrics.csv` — one row per (cluster × model × label_mode) multivariate metric
 - `model_summary_overall.csv` — per model, `r2_variance_weighted`/`rmse_aggregate` averaged **across clusters** (each cluster contributes one number regardless of how many targets it has) — a more principled ranking than `model_summary.csv`'s flat pooling, worth checking alongside it rather than instead of it
-- `all_clusters_permutation_null.csv` — every cluster's `combined_permutation_null.csv` rows pooled together (ElasticNet/Lasso family only). Kept as its own table rather than merged into `model_summary_overall.csv` — an R² and a p-value answer different questions, and conflating them into one ranking would misrepresent both
+- `all_clusters_permutation_null.csv` — every cluster's `combined_permutation_null.csv` rows pooled together (ElasticNet/Lasso family + `xgboost_indep`). Kept as its own table rather than merged into `model_summary_overall.csv` — an R² and a p-value answer different questions, and conflating them into one ranking would misrepresent both
 - `{model}_r2_heatmap.pdf` — R² heatmap (clusters × archetypes)
 - `model_r2_boxplot.pdf` — R² distribution per model
 - `model_r2_stripplot.pdf` — per-archetype R², faceted by cluster
@@ -183,11 +195,11 @@ python scripts/006_finalize_model.py \
     --outdir results/final_models
 ```
 
-It selects HVGs once (from all samples — there's no held-out fold left to protect), fits a `StandardScaler`, then runs plain (non-nested) `RandomizedSearchCV` — which performs hyperparameter selection via k-fold CV and refits on the full data with the winning combination in one call. The result is saved as a single `joblib` bundle (`{cluster}_{model}_{label_mode}_final_model.joblib`) containing the fitted estimator(s), scaler, exact feature names/order, and metadata (chosen hyperparameters, CV scores) — everything needed to transform and score a new sample's pseudobulk profile later.
+If `train_only_covs`/`train_test_covs` are set (same `meta_file` convention as step 2), technical covariates are regressed out once, on the full dataset, before HVG selection — there's no held-out fold here to protect either way. It then selects HVGs once (from all samples), fits a `StandardScaler`, then runs plain (non-nested) `RandomizedSearchCV` — which performs hyperparameter selection via k-fold CV and refits on the full data with the winning combination in one call. The result is saved as a single `joblib` bundle (`{cluster}_{model}_{label_mode}_final_model.joblib`) containing the fitted estimator(s), scaler, exact feature names/order, and metadata (chosen hyperparameters, CV scores) — everything needed to transform and score a new sample's pseudobulk profile later. If `train_test_covs` was used, the bundle also includes `covariate_model` (the fitted `ColumnTransformer`/`LinearRegression` pair) to reapply that same adjustment to a genuinely new sample's covariates before scoring; `train_only_covs`' adjustment is fit-and-discarded and never reapplied (see step 2's covariate section), so `train_only_covs` is recorded in the bundle for provenance only.
 
-Supports `xgboost`, `rf`, `elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep`. **Does not support `mil`** — MIL's persistence needs a meaningfully different format (torch model state, attention weights); passing `--model mil` raises a clear error.
+Supports `xgboost_indep`, `xgboost_joint`, `rf`, `elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep`. **Does not support `mil`** — MIL's persistence needs a meaningfully different format (torch model state, attention weights); passing `--model mil` raises a clear error.
 
-Note: the permutation-null significance test (`007_permutation_null.py`) is a separate concern from finalizing — it runs automatically in the main pipeline for the ElasticNet/Lasso family, from each model's own real nested-CV fold_metrics, with no dependency on this script. See step 2a above.
+Note: the permutation-null significance test (`007_permutation_null.py`) is a separate concern from finalizing — it runs automatically in the main pipeline for the ElasticNet/Lasso family and `xgboost_indep`, from each model's own real nested-CV fold_metrics, with no dependency on this script. See step 2a above.
 
 ---
 
@@ -199,6 +211,11 @@ Note: the permutation-null significance test (`007_permutation_null.py`) is a se
 | `sample_col` | `donor_id` | Per-sample identifier column |
 | `raw_or_clr_pca` | `raw` | `raw` uses simplex weight targets (e.g. `B1`); `pca` uses CLR-PCA transformed targets (e.g. `B1_clr_pca`) |
 | `run_independent_pca_fits` | `true` | Only used when `raw_or_clr_pca == "pca"`: also fit independent per-target ElasticNet/Lasso (`elasticnet_indep`, `lasso_indep`) alongside the joint multi-task fits |
+| `run_xgboost_joint` | `false` | Also fit `xgboost_joint` (native `multi_strategy="multi_output_tree"`, requires XGBoost≥2.0) alongside the default `xgboost_indep`. Runs via `xgboost2_env` below, not `container_ml` |
+| `meta_file` | `""` | Per-sample metadata CSV for technical covariate regression (first column = sample ID, matching `sample_col`). Required only if either covariate list below is non-empty |
+| `train_only_covs` | `""` | Space-separated covariate column(s) regressed out of the training fold only — not applied to the held-out fold, never persisted. For covariates unmeasurable/inapplicable in external data (e.g. a batch/pooling identifier) |
+| `train_test_covs` | `""` | Space-separated covariate column(s) regressed out of both the training and held-out fold (fit-on-train/apply-to-test) — persisted in `006_finalize_model.py`'s bundle. For covariates measurable identically in any dataset (e.g. `total_counts`/`n_genes_expressed`) |
+| `xgboost2_env` | `""` | Container/environment with XGBoost≥2.0, used only by `xgboost_joint`. Required when `run_xgboost_joint = "true"` |
 | `hvg_pct` | `0.20` | Fraction of genes to keep as HVGs — reselected per outer CV fold in `002`/`003`, not at data-prep time |
 | `hvg_max` | `2000` | Hard cap on number of HVGs — same per-fold reselection as `hvg_pct` |
 | `pseudobulk_agg` | `mean` | Aggregation method (`mean` or `sum`); also used by `003_train_mil.py` to pseudobulk each fold's training bags for HVG ranking |
@@ -217,4 +234,4 @@ Note: the permutation-null significance test (`007_permutation_null.py`) is a se
 
 ## Dependencies
 
-Tree models require `scikit-learn`, `xgboost`, and `anndata`/`scanpy`. MIL training additionally requires `torch`. The Nextflow pipeline pulls the appropriate Singularity containers automatically on the Sanger cluster.
+Tree models require `scikit-learn`, `xgboost`, and `anndata`/`scanpy`. MIL training additionally requires `torch`. The Nextflow pipeline pulls the appropriate Singularity containers automatically on the Sanger cluster — except `xgboost_joint`, which needs XGBoost≥2.0 and runs in whatever container/environment you point `xgboost2_env` at, separately from `container_ml`.

@@ -23,7 +23,9 @@ Design:
   - HVGs are still reselected fresh per outer fold, per permutation, from that
     fold's training data only (helpers.run_fixed_cv / select_hvgs) — this is
     NOT part of what gets fixed, it's cheap and remains part of the procedure
-    being tested.
+    being tested. Technical covariate regression (--meta_file /
+    --train_only_covs / --train_test_covs), if enabled for the real analysis,
+    is refit fresh per permutation the same way — see helpers.regress_out_covariates.
   - y is permuted row-wise as ONE consistent shuffle across all target columns
     (not independently per column), breaking the sample-level X<->y
     correspondence while preserving whatever structure exists across targets.
@@ -37,10 +39,28 @@ Design:
 
 Runs automatically in the Nextflow DAG (workflow/main.nf's PERMUTATION_NULL
 process) for the elasticnet/lasso family (elasticnet, lasso, elasticnet_indep,
-lasso_indep) right after TRAIN_TREE_MODELS, so results are available before
-EVALUATE_MODELS/AGGREGATE_RESULTS. Not run for xgboost/rf (xgboost has no
-clean single-y-free multi-output path once hyperparameters are fixed rather
-than searched; out of scope here) or MIL.
+lasso_indep) and xgboost_indep, right after TRAIN_TREE_MODELS, so results are
+available before EVALUATE_MODELS/AGGREGATE_RESULTS.
+
+xgboost_indep is a hybrid case, handled via run_fixed_cv's `per_target_fit`
+flag: its hyperparameter *search* is joint in the real pipeline (one shared
+setting picked via the aggregate variance-weighted score — see
+run_nested_cv_tree — so its fold_metrics.csv has no per-target archetype
+breakdown, and derive_best_params returns a single shared dict, same as
+elasticnet/lasso), but its *fitting* is always independent per target
+regardless, because the real pipeline wraps it in MultiOutputRegressor (plain
+XGBRegressor doesn't support multi-output y directly without XGBoost>=2.0's
+multi_strategy — see xgboost_joint below). _PER_TARGET_FIT_MODELS below forces
+the correct per-target fitting even though best_params is a shared dict, not
+a list.
+
+Not run for rf (RandomForestRegressor is natively, genuinely joint — no
+independent-fitting edge case to work around, but also no clean way to force
+per-target fitting without changing what "rf" actually means), xgboost_joint
+(natively joint the same way rf is, but also needs the separate XGBoost>=2.0
+environment set via params.xgboost2_env — wiring that through this script's
+container_ml-based process is out of scope here), or MIL (needs a different
+persistence/fitting approach entirely; out of scope here).
 
 Example:
     python scripts/007_permutation_null.py \\
@@ -66,11 +86,23 @@ import pandas as pd
 sys.path.append("scripts")
 from helpers import (
     apply_label_mode,
+    load_meta_file,
     load_pseudobulk,
     run_fixed_cv,
+    split_covariate_names,
+    validate_covariate_lists,
 )
 
 _INDEP_MODELS = ("elasticnet_indep", "lasso_indep")
+# xgboost_indep's hyperparameter SEARCH is joint (one shared setting, so its
+# fold_metrics.csv has no per-target archetype breakdown — same parsing as
+# elasticnet/lasso in derive_best_params), but its FITTING is always
+# independent per target regardless (see run_fixed_cv's per_target_fit
+# docstring) — keep this separate from _INDEP_MODELS, which governs
+# fold_metrics parsing, not fitting. xgboost_joint is NOT included: it's
+# natively joint in both search and fitting (like rf), and isn't run through
+# this script at all — see the module docstring.
+_PER_TARGET_FIT_MODELS = _INDEP_MODELS + ("xgboost_indep",)
 
 
 def parse_args():
@@ -100,6 +132,11 @@ def parse_args():
     p.add_argument("--seed",                type=int,   default=42,
                    help="Base seed: shared KFold split for observed + every "
                         "permutation; permutation i's row-shuffle uses seed+1+i")
+    p.add_argument("--meta_file",           default=None,
+                   help="Per-sample metadata CSV — must match whatever the real "
+                        "002_train_tree_models.py run used, if it used covariate regression.")
+    p.add_argument("--train_only_covs",     nargs="*", default=[])
+    p.add_argument("--train_test_covs",     nargs="*", default=[])
     p.add_argument("--outdir",              required=True)
     return p.parse_args()
 
@@ -146,7 +183,7 @@ def derive_best_params(fold_metrics_path, model_name, arch_cols):
 
 def _param_path_for(model_name, args):
     return {
-        "xgboost":          args.xgb_params,
+        "xgboost_indep":    args.xgb_params,
         "rf":               args.rf_params,
         "elasticnet":       args.elasticnet_params,
         "lasso":            args.lasso_params,
@@ -169,6 +206,8 @@ def _per_pc_r2(y, oof_preds):
 
 def main():
     args = parse_args()
+    args.train_only_covs = split_covariate_names(args.train_only_covs)
+    args.train_test_covs = split_covariate_names(args.train_test_covs)
     os.makedirs(args.outdir, exist_ok=True)
 
     print(f"Loading pseudo-bulk from {args.pseudobulk}")
@@ -187,6 +226,21 @@ def main():
         X = X[keep_mask]
         y = y[keep_mask]
         samples = [s for s, k in zip(samples, keep_mask) if k]
+
+    df_meta = None
+    if args.train_only_covs or args.train_test_covs:
+        if not args.meta_file:
+            raise ValueError("--train_only_covs/--train_test_covs given but --meta_file is not set")
+        print(f"Loading covariate metadata from {args.meta_file}")
+        df_meta = load_meta_file(args.meta_file)
+        validate_covariate_lists(df_meta, args.train_only_covs, args.train_test_covs)
+        keep_idx = [i for i, s in enumerate(samples) if s in df_meta.index]
+        if len(keep_idx) < len(samples):
+            print(f"  Dropping {len(samples) - len(keep_idx)} samples not in meta_file")
+        X       = X[keep_idx]
+        samples = [samples[i] for i in keep_idx]
+        y       = y[keep_idx]
+        print(f"  train_only_covs={args.train_only_covs}  train_test_covs={args.train_test_covs}")
 
     print(f"X={X.shape}  y={y.shape}  label_mode={args.label_mode}")
 
@@ -212,6 +266,9 @@ def main():
     oof_observed = run_fixed_cv(
         X, y, model_name, best_params, param_grid_path, args.n_folds, args.seed,
         n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
+        per_target_fit=(model_name in _PER_TARGET_FIT_MODELS),
+        samples=samples, covariate_df=df_meta,
+        train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
     )
     observed_r2 = _per_pc_r2(y, oof_observed)
     for col, r2 in zip(arch_cols, observed_r2):
@@ -230,6 +287,9 @@ def main():
         oof_perm = run_fixed_cv(
             X, y_perm, model_name, best_params, param_grid_path, args.n_folds, args.seed,
             n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
+            per_target_fit=(model_name in _PER_TARGET_FIT_MODELS),
+            samples=samples, covariate_df=df_meta,
+            train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
         )
         r2_i = _per_pc_r2(y_perm, oof_perm)
         null_r2[i] = r2_i

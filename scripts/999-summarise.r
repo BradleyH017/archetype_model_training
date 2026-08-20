@@ -7,6 +7,7 @@ library(ggrepel)
 # options
 resdir = "results/tree_models/"
 permute_dir = "results/permutation_null/"
+prepared_data_dir = "results/prepared_data/"
 outdir = "OUT/"
 source("scripts/999-helpers.r")
 if(!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
@@ -72,7 +73,8 @@ sumdf = res$overall %>%
         min_r2 = min(r2_variance_weighted), 
         max_r2 = max(r2_variance_weighted)
     ) %>% 
-    ungroup()
+    ungroup() %>% 
+    arrange(desc(med_r2))
 
 write.table(sumdf, file = file.path(outdir, "overall_metrics_summary.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
 
@@ -94,22 +96,33 @@ best_model = res$overall %>%
     filter(r2_variance_weighted == max(r2_variance_weighted))
 
 # Plot the per-PC r2 for this model
-per_cluster_weighted_r2 = res$sum %>% 
-    filter(model == best_model$model) %>% 
-    group_by(cluster) %>% 
+per_cluster_weighted_r2 = res$sum %>%
+    filter(model == best_model$model) %>%
+    group_by(cluster) %>%
     summarise(weighted_r2 = mean(r2), .groups = "drop")
 
-res$sum %>% 
-    filter(model == best_model$model) %>% 
+best_model_sum = res$sum %>%
+    filter(model == best_model$model)
+
+# Variance explained per PC, computed on the fly from the TRUE archetype
+# scores (results/prepared_data/{cluster}.targets.csv) — this is exactly the
+# per-column weight sklearn's r2_score(multioutput='variance_weighted') uses
+# internally (np.var(y_true, axis=0)), not a stored/precomputed PCA eigenvalue.
+# See get_pc_variance() in 999-helpers.r.
+pc_variance = get_pc_variance(prepared_data_dir, unique(best_model_sum$cluster))
+
+best_model_sum %>%
     left_join(per_cluster_weighted_r2, by = "cluster") %>%
-    ggplot(aes(x=rmse, y=r2)) +
+    left_join(pc_variance, by = c("cluster", "archetype")) %>%
+    ggplot(aes(x=variance, y=r2)) +
     geom_point() +
+    geom_smooth(method = "lm", se = FALSE, color = "blue", linetype = "dotted") +
     geom_text_repel(aes(label = archetype), size = 3, max.overlaps = 20) +
     geom_line(aes(y=weighted_r2), color="red", linetype="dashed") +
     facet_wrap(~cluster, scales = "free_x") +
     theme_classic() +
-    ggtitle(paste("Per-PC R2 for best model:", best_model$model)) +
-    xlab("RMSE") +
+    ggtitle(paste("Per-PC R2 vs. variance explained for best model:", best_model$model)) +
+    xlab("Variance of true archetype PC score (across samples)") +
     ylab("R2") +
     ylim(0, 1)
 

@@ -26,6 +26,15 @@ What it does:
      estimator(s), scaler, exact feature names/order, and metadata — to one
      joblib bundle.
 
+Technical covariate regression (--meta_file / --train_only_covs /
+--train_test_covs), if used, is applied once to the full dataset before HVG
+selection (there's no held-out fold here to protect — see step 2 above). Only
+the train_test_covs adjustment is persisted in the bundle (as
+bundle["covariate_model"]) for reapplication to genuinely new samples at
+scoring time — see helpers.regress_out_covariates for why train_only_covs is
+fit-and-discarded instead. bundle["train_only_covs"] records which covariates
+were used for provenance only; they are never reapplied.
+
 Does NOT support "mil": MIL's persistence needs a meaningfully different
 format (torch model state dict, attention weights) and is out of scope here —
 running this script with --model mil raises a clear error rather than doing
@@ -56,13 +65,22 @@ sys.path.append("scripts")
 from helpers import (
     apply_label_mode,
     build_estimator,
+    load_meta_file,
     load_pseudobulk,
+    regress_out_covariates,
     select_hvgs,
+    split_covariate_names,
+    validate_covariate_lists,
     VARIANCE_WEIGHTED_R2_SCORER,
 )
 
-_INDEP_MODELS = ("elasticnet_indep", "lasso_indep")
-_JOINT_MODELS = ("xgboost", "rf", "elasticnet", "lasso")
+_INDEP_MODELS = ("elasticnet_indep", "lasso_indep", "xgboost_indep")
+# xgboost_indep is fit per-target here (not via MultiOutputRegressor — see
+# helpers.run_nested_cv_tree), same reasoning as elasticnet_indep/lasso_indep.
+# xgboost_joint natively accepts 2D y (multi_strategy="multi_output_tree",
+# requires XGBoost>=2.0 — see helpers.build_estimator), so it belongs with the
+# other genuinely joint fits below despite the name similarity to xgboost_indep.
+_JOINT_MODELS = ("xgboost_joint", "rf", "elasticnet", "lasso")
 _SUPPORTED    = _JOINT_MODELS + _INDEP_MODELS
 
 
@@ -93,13 +111,19 @@ def parse_args():
     p.add_argument("--n_jobs",           type=int, default=1,
                    help="n_jobs for RandomizedSearchCV")
     p.add_argument("--device",           default="cpu", choices=["cpu", "cuda"])
+    p.add_argument("--meta_file",        default=None,
+                   help="Per-sample metadata CSV — must match whatever the real "
+                        "002_train_tree_models.py run used, if it used covariate regression.")
+    p.add_argument("--train_only_covs",  nargs="*", default=[])
+    p.add_argument("--train_test_covs",  nargs="*", default=[])
     p.add_argument("--outdir",           required=True)
     return p.parse_args()
 
 
 def _param_path_for(model_name, args):
     return {
-        "xgboost":          args.xgb_params,
+        "xgboost_indep":    args.xgb_params,
+        "xgboost_joint":    args.xgb_params,
         "rf":               args.rf_params,
         "elasticnet":       args.elasticnet_params,
         "lasso":            args.lasso_params,
@@ -110,6 +134,8 @@ def _param_path_for(model_name, args):
 
 def main():
     args = parse_args()
+    args.train_only_covs = split_covariate_names(args.train_only_covs)
+    args.train_test_covs = split_covariate_names(args.train_test_covs)
 
     if args.model == "mil":
         raise ValueError(
@@ -147,6 +173,31 @@ def main():
         X       = X[keep_mask]
         samples = [s for s, k in zip(samples, keep_mask) if k]
         y       = y[keep_mask]
+
+    df_meta = None
+    covariate_model = None  # (ColumnTransformer, LinearRegression) for train_test_covs, or None
+    if args.train_only_covs or args.train_test_covs:
+        if not args.meta_file:
+            raise ValueError("--train_only_covs/--train_test_covs given but --meta_file is not set")
+        print(f"Loading covariate metadata from {args.meta_file}")
+        df_meta = load_meta_file(args.meta_file)
+        validate_covariate_lists(df_meta, args.train_only_covs, args.train_test_covs)
+        keep_idx = [i for i, s in enumerate(samples) if s in df_meta.index]
+        if len(keep_idx) < len(samples):
+            print(f"  Dropping {len(samples) - len(keep_idx)} samples not in meta_file")
+        X       = X[keep_idx]
+        samples = [samples[i] for i in keep_idx]
+        y       = y[keep_idx]
+
+        print(f"  Regressing out covariates (fit on all {len(samples)} samples — no held-out "
+              f"fold here): train_only_covs={args.train_only_covs}  train_test_covs={args.train_test_covs}")
+        # No held-out fold in this script — every sample is "training" from
+        # here on, so X_te == X_tr; only the train_test_covs adjustment
+        # (covariate_model) is meaningful afterwards, for reapplication to
+        # genuinely new samples at scoring time.
+        X, _, covariate_model = regress_out_covariates(
+            X, X, df_meta, samples, samples, args.train_only_covs, args.train_test_covs,
+        )
 
     print(f"X={X.shape}  y={y.shape}  label_mode={args.label_mode}")
 
@@ -206,6 +257,9 @@ def main():
             "hvg_max":        args.hvg_max,
             "best_params":    best_params,
             "best_cv_scores": best_scores,
+            "covariate_model": covariate_model,
+            "train_test_covs": args.train_test_covs,
+            "train_only_covs": args.train_only_covs,
         }
     else:
         y_fit = y if n_targets > 1 else y.ravel()
@@ -223,6 +277,9 @@ def main():
             "hvg_max":        args.hvg_max,
             "best_params":    params,
             "best_cv_scores": score,
+            "covariate_model": covariate_model,
+            "train_test_covs": args.train_test_covs,
+            "train_only_covs": args.train_only_covs,
         }
 
     outpath = os.path.join(args.outdir, f"{args.cluster}_{args.model}_{args.label_mode}_final_model.joblib")

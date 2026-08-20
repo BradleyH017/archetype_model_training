@@ -6,8 +6,11 @@ Sections:
   1. Data I/O          — load_pseudobulk, load_mil_bags
   2. Feature prep      — filter_lowly_expressed_genes, select_hvgs, pseudobulk_aggregate,
                          compute_abundance, get_archetype_weight_cols
+  2b. Covariate regression — split_covariate_names, load_meta_file,
+                         validate_covariate_lists, fit_covariate_design,
+                         transform_covariate_design, regress_out_covariates
   3. Tree/linear models — build_estimator, run_nested_cv_tree, run_fixed_cv
-                         (xgboost, rf, elasticnet, lasso)
+                         (xgboost_indep, xgboost_joint, rf, elasticnet, lasso)
   4. MIL               — AttentionMIL, MILDataset, mil_collate, train_epoch,
                          evaluate_bags, build_mil_model, fit_mil_model,
                          nested_cv_mil
@@ -25,12 +28,13 @@ import pandas as pd
 import scipy.sparse as sp
 from joblib import Parallel, delayed
 from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import ElasticNet, Lasso, MultiTaskElasticNet, MultiTaskLasso
+from sklearn.linear_model import ElasticNet, Lasso, LinearRegression, MultiTaskElasticNet, MultiTaskLasso
 from sklearn.metrics import make_scorer, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, RandomizedSearchCV
 from sklearn.multioutput import MultiOutputRegressor
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 # import xgboost as xgb
 
 warnings.filterwarnings("ignore")
@@ -210,6 +214,141 @@ def apply_label_mode(y, mode, min_score=0.5):
     return y_onehot, keep_mask
 
 
+# ─── 2b. Technical covariate regression ──────────────────────────────────────
+# Removes technical-covariate effects from pseudobulk features BEFORE HVG
+# selection, since select_hvgs ranks genes by raw variance — a covariate that
+# inflates variance in biologically uninformative genes can otherwise crowd
+# out real signal from the HVG panel. Two distinct regimes, matching whether a
+# covariate will be available/meaningful for genuinely external data:
+#   train_only_covs — regressed out of the TRAINING rows only; the held-out
+#     fold (or, in 006_finalize_model.py, any future external sample) is left
+#     untouched, and the fitted model is never persisted. For covariates that
+#     are specific to this dataset's own processing (e.g. a batch/pooling
+#     identifier) and therefore uncomputable/meaningless for external data —
+#     adjusting the held-out side too would assume a correction capability
+#     you won't actually have at deployment, inflating the OOF estimate.
+#   train_test_covs — fit on training rows, then the SAME fitted adjustment is
+#     applied to the held-out fold (or persisted and applied to new external
+#     samples). For covariates that are measurable identically in any dataset
+#     (e.g. per-sample QC metrics like total_counts/n_genes) — the standard
+#     leakage-safe fit-on-train/apply-to-test pattern, same as StandardScaler.
+
+def split_covariate_names(raw_names):
+    """Normalize a --train_only_covs/--train_test_covs argparse value (nargs='*')
+    into a clean list of individual covariate names.
+
+    Handles comma-separated, space-separated, and mixed input the same way:
+    argparse's nargs='*' only splits on shell word boundaries, so a config
+    value with no spaces (e.g. Nextflow's params.train_only_covs interpolated
+    unquoted into the command line) arrives as ONE token containing every
+    name joined by commas, not as separate tokens — this splits each token on
+    commas too and strips whitespace, so "a,b,c", "a b c", and "a, b, c" all
+    normalize to the same ["a", "b", "c"].
+    """
+    out = []
+    for token in raw_names:
+        out.extend(t.strip() for t in token.split(",") if t.strip())
+    return out
+
+
+def load_meta_file(meta_file, sample_col=None):
+    """Load a per-sample metadata CSV, indexed by its first column (matching
+    the convention already used for targets.csv elsewhere in this pipeline).
+    sample_col is accepted only for a clearer error message if the file looks
+    like it wasn't indexed as expected; the index itself is always column 0.
+    """
+    df_meta = pd.read_csv(meta_file, index_col=0)
+    if df_meta.index.duplicated().any():
+        dupes = df_meta.index[df_meta.index.duplicated()].unique().tolist()
+        raise ValueError(f"meta_file has duplicate sample IDs in its first column: {dupes}")
+    return df_meta
+
+
+def validate_covariate_lists(df_meta, train_only_covs, train_test_covs):
+    overlap = set(train_only_covs) & set(train_test_covs)
+    if overlap:
+        raise ValueError(
+            f"Covariate(s) {sorted(overlap)} appear in both train_only_covs and "
+            "train_test_covs — each covariate must be regressed out one way or the other, not both."
+        )
+    missing = [c for c in list(train_only_covs) + list(train_test_covs) if c not in df_meta.columns]
+    if missing:
+        raise ValueError(f"Covariate(s) {missing} not found in meta_file columns: "
+                          f"{df_meta.columns.tolist()}")
+
+
+def fit_covariate_design(df_meta, samples, cov_names):
+    """Build a covariate design matrix for `samples`, fitting the encoding.
+
+    Categorical vs continuous is inferred from dtype: non-numeric (e.g. str)
+    columns are one-hot encoded (dropping one reference level; unseen
+    categories at transform time become an all-zero row rather than an
+    error); numeric columns are passed through unchanged.
+
+    Returns (design_matrix, fitted_ColumnTransformer), or (None, None) if
+    cov_names is empty.
+    """
+    if not cov_names:
+        return None, None
+    sub = df_meta.loc[samples, list(cov_names)]
+    cat_cols  = [c for c in cov_names if not pd.api.types.is_numeric_dtype(sub[c])]
+    cont_cols = [c for c in cov_names if c not in cat_cols]
+    transformers = []
+    if cat_cols:
+        transformers.append(("cat", OneHotEncoder(drop="first", handle_unknown="ignore"), cat_cols))
+    ct = ColumnTransformer(transformers, remainder="passthrough" if cont_cols else "drop")
+    design = np.asarray(ct.fit_transform(sub), dtype=float)
+    if design.shape[1] >= design.shape[0]:
+        print(f"WARNING: covariate design matrix for {cov_names} has "
+              f"{design.shape[1]} columns for only {design.shape[0]} training "
+              "samples — the fitted adjustment may be poorly determined.", flush=True)
+    return design, ct
+
+
+def transform_covariate_design(df_meta, samples, cov_names, fitted_ct):
+    """Apply an already-fitted ColumnTransformer (from fit_covariate_design)
+    to a different set of samples — e.g. a held-out fold, or genuinely new
+    external samples at deployment time."""
+    sub = df_meta.loc[samples, list(cov_names)]
+    return np.asarray(fitted_ct.transform(sub), dtype=float)
+
+
+def regress_out_covariates(X_tr, X_te, df_meta, samples_tr, samples_te,
+                           train_only_covs, train_test_covs):
+    """Remove technical-covariate effects from pseudobulk features X_tr/X_te
+    (samples × features), fitting only on the training rows. See the module
+    comment above section 2b for the train_only_covs vs train_test_covs
+    distinction. Either list may be empty/None to skip that regime entirely.
+
+    Sequential, not joint: train_only_covs is regressed out of X_tr first, then
+    train_test_covs is regressed out of the (now train-only-adjusted) X_tr,
+    with the same fitted model applied to X_te.
+
+    Returns (X_tr_adj, X_te_adj, test_cov_model) — test_cov_model is the
+    (fitted ColumnTransformer, fitted LinearRegression) pair for
+    train_test_covs, needed by 006_finalize_model.py to persist and later
+    reapply this adjustment to new external samples; None if train_test_covs
+    is empty.
+    """
+    X_tr_adj, X_te_adj = X_tr, X_te
+
+    if train_only_covs:
+        design_tr, _ = fit_covariate_design(df_meta, samples_tr, train_only_covs)
+        reg = LinearRegression().fit(design_tr, X_tr_adj)
+        X_tr_adj = X_tr_adj - design_tr @ reg.coef_.T
+
+    test_cov_model = None
+    if train_test_covs:
+        design_tr, ct = fit_covariate_design(df_meta, samples_tr, train_test_covs)
+        reg = LinearRegression().fit(design_tr, X_tr_adj)
+        X_tr_adj = X_tr_adj - design_tr @ reg.coef_.T
+        design_te = transform_covariate_design(df_meta, samples_te, train_test_covs, ct)
+        X_te_adj  = X_te_adj - design_te @ reg.coef_.T
+        test_cov_model = (ct, reg)
+
+    return X_tr_adj, X_te_adj, test_cov_model
+
+
 # ─── 3. Tree models ───────────────────────────────────────────────────────────
 
 def build_estimator(model_name, param_grid_path, seed, n_jobs=1, device="cpu"):
@@ -218,7 +357,7 @@ def build_estimator(model_name, param_grid_path, seed, n_jobs=1, device="cpu"):
     """Instantiate a base estimator and load its hyperparameter grid from JSON."""
     with open(param_grid_path) as f:
         grid = json.load(f)
-    if model_name == "xgboost":
+    if model_name in ("xgboost_indep", "xgboost_joint"):
         xgb_kwargs = dict(
             objective   = "reg:squarederror",
             tree_method = "hist",
@@ -226,7 +365,25 @@ def build_estimator(model_name, param_grid_path, seed, n_jobs=1, device="cpu"):
             n_jobs      = n_jobs,
             verbosity   = 0,
         )
-        if device == "cuda":
+        if model_name == "xgboost_joint":
+            # Native joint multi-output fit: ONE shared ensemble of trees per
+            # cluster, each leaf holding a vector across all archetype targets
+            # (requires XGBoost>=2.0 — see version check below). Upstream still
+            # calls this strategy experimental with limited feature support
+            # (no Tree SHAP, single shared feature_importances_ rather than
+            # per-target) and only guarantees tree_method="hist" is feature
+            # complete for it, so GPU is deliberately not wired up here
+            # regardless of --device.
+            major = int(xgb.__version__.split(".")[0])
+            if major < 2:
+                raise RuntimeError(
+                    f"xgboost_joint requires XGBoost>=2.0.0 for "
+                    f"multi_strategy='multi_output_tree' (found {xgb.__version__} "
+                    "in this environment). Run xgboost_joint in the environment set "
+                    "via params.xgboost2_env, not params.container_ml."
+                )
+            xgb_kwargs["multi_strategy"] = "multi_output_tree"
+        elif device == "cuda":
             xgb_kwargs["tree_method"] = "gpu_hist"
             # Verify this XGBoost build was compiled with GPU support
             try:
@@ -264,16 +421,31 @@ def build_estimator(model_name, param_grid_path, seed, n_jobs=1, device="cpu"):
 
 def _fit_outer_fold(fold_i, tr_idx, te_idx, X, y, estimator, search_grid,
                     n_inner, n_iter, seed, n_jobs_inner, n_targets,
-                    n_gene_features=None, hvg_pct=None, hvg_max=None):
+                    n_gene_features=None, hvg_pct=None, hvg_max=None,
+                    samples=None, covariate_df=None,
+                    train_only_covs=None, train_test_covs=None):
     """Run one outer CV fold: inner HPO search + refit + predict. Used by run_nested_cv_tree.
 
     If n_gene_features is given, HVGs are reselected here from X_tr's gene
     block ONLY (columns [:n_gene_features]) — fold-specific, so genes are
     never ranked using samples that end up in the held-out test fold. Columns
     at/after n_gene_features (abundance features) are always kept as-is.
+
+    If covariate_df is given (with samples aligned to X's row order), technical
+    covariates are regressed out BEFORE HVG selection — see regress_out_covariates
+    and the section 2b module comment for the train_only_covs/train_test_covs
+    distinction. Fit-and-discarded per fold, same lifecycle as the scaler below.
     """
     X_tr_full, X_te_full = X[tr_idx], X[te_idx]
     y_tr, y_te = y[tr_idx], y[te_idx]
+
+    if covariate_df is not None and (train_only_covs or train_test_covs):
+        samples_tr = [samples[i] for i in tr_idx]
+        samples_te = [samples[i] for i in te_idx]
+        X_tr_full, X_te_full, _ = regress_out_covariates(
+            X_tr_full, X_te_full, covariate_df, samples_tr, samples_te,
+            train_only_covs, train_test_covs,
+        )
 
     if n_gene_features is not None:
         hvg_idx_local = select_hvgs(X_tr_full[:, :n_gene_features], hvg_pct, hvg_max)
@@ -331,8 +503,10 @@ def _fit_outer_fold(fold_i, tr_idx, te_idx, X, y, estimator, search_grid,
 def run_nested_cv_tree(X, y, model_name, base, grid,
                        n_outer, n_inner, n_iter, seed, feature_names,
                        n_jobs_outer=1, n_jobs_inner=1,
-                       n_gene_features=None, hvg_pct=None, hvg_max=None):
-    """Nested CV for XGBoost / RF / ElasticNet / Lasso with RandomizedSearchCV inner loop.
+                       n_gene_features=None, hvg_pct=None, hvg_max=None,
+                       samples=None, covariate_df=None,
+                       train_only_covs=None, train_test_covs=None):
+    """Nested CV for XGBoost (indep/joint) / RF / ElasticNet / Lasso with RandomizedSearchCV inner loop.
 
     n_jobs_outer : parallel outer folds (set to n_outer for max parallelism;
                    use n_jobs_inner=1 and estimator n_jobs=1 to avoid oversubscription)
@@ -340,6 +514,10 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
     n_gene_features, hvg_pct, hvg_max : if n_gene_features is given, HVGs are
         reselected per outer fold from that fold's training samples only (see
         _fit_outer_fold) instead of using a fixed pre-selected panel.
+    samples, covariate_df, train_only_covs, train_test_covs : if covariate_df
+        is given (samples aligned to X's row order), technical covariates are
+        regressed out per outer fold before HVG selection — see
+        regress_out_covariates and the section 2b module comment.
     Returns fold_metrics list, oof_preds (n_samples × n_targets), and all_imps
     — a list of (sel_idx, imp) tuples, one per outer fold, since fold-specific
     HVG reselection means different folds may keep different gene columns.
@@ -347,8 +525,11 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
     outer_cv  = KFold(n_splits=n_outer, shuffle=True, random_state=seed)
     n_targets = y.shape[1]
 
-    # Wrap XGBoost in MultiOutputRegressor for multi-target consistency
-    if n_targets > 1 and model_name == "xgboost":
+    # Wrap XGBoost in MultiOutputRegressor for multi-target consistency — only
+    # "xgboost_indep" needs this. "xgboost_joint" natively accepts 2D y
+    # (multi_strategy="multi_output_tree", set in build_estimator), same as
+    # rf and the MultiTask* linear models below.
+    if n_targets > 1 and model_name == "xgboost_indep":
         estimator   = MultiOutputRegressor(base, n_jobs=1)
         search_grid = {f"estimator__{k}": v for k, v in grid.items()}
     else:
@@ -360,6 +541,8 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
             fold_i, tr_idx, te_idx, X, y, estimator, search_grid,
             n_inner, n_iter, seed, n_jobs_inner, n_targets,
             n_gene_features=n_gene_features, hvg_pct=hvg_pct, hvg_max=hvg_max,
+            samples=samples, covariate_df=covariate_df,
+            train_only_covs=train_only_covs, train_test_covs=train_test_covs,
         )
         for fold_i, (tr_idx, te_idx) in enumerate(outer_cv.split(X))
     )
@@ -378,7 +561,8 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
 
 
 def run_fixed_cv(X, y, model_name, best_params, param_grid_path, n_folds, seed,
-                 n_gene_features=None, hvg_pct=None, hvg_max=None):
+                 n_gene_features=None, hvg_pct=None, hvg_max=None, per_target_fit=None,
+                 samples=None, covariate_df=None, train_only_covs=None, train_test_covs=None):
     """Plain (non-nested) K-fold CV with FIXED hyperparameters — no inner search.
 
     Used for permutation-null testing (007_permutation_null.py): the expensive
@@ -388,13 +572,28 @@ def run_fixed_cv(X, y, model_name, best_params, param_grid_path, n_folds, seed,
     select_hvgs / _fit_outer_fold), exactly as in the real nested-CV pipeline
     — only the hyperparameter *search* is skipped, not the feature reselection.
 
-    best_params : dict, applied to every target (joint models: xgboost/rf/
-        elasticnet/lasso) — OR a list of dicts, one per target column, in the
-        same order as y's columns (independent models: elasticnet_indep/
-        lasso_indep).
+    best_params : dict, applied to every target — OR a list of dicts, one per
+        target column, in the same order as y's columns (independent-search
+        models: elasticnet_indep/lasso_indep).
+    per_target_fit : if True, fit one independent estimator per target column
+        even though best_params is a single SHARED dict — this is
+        xgboost_indep's case: its hyperparameter *search* is joint (one shared
+        setting picked via the aggregate variance-weighted score, so
+        best_params is a plain dict, same as elasticnet/lasso/rf), but its
+        *fitting* is always independent per target regardless, because the
+        real pipeline wraps it in MultiOutputRegressor (run_nested_cv_tree) —
+        plain XGBRegressor doesn't support multi-output y directly without
+        XGBoost>=2.0's multi_strategy (see xgboost_joint in build_estimator).
+        Defaults to isinstance(best_params, list) if not given, which
+        preserves existing elasticnet_indep/lasso_indep/joint behavior exactly.
     param_grid_path : passed through to build_estimator purely to construct
         the base estimator object; its grid contents are irrelevant here since
         hyperparameters are immediately overridden via set_params().
+    samples, covariate_df, train_only_covs, train_test_covs : same covariate
+        regression as run_nested_cv_tree/_fit_outer_fold (see the section 2b
+        module comment) — refit fresh every call, same as HVG reselection,
+        since 007_permutation_null.py calls this once per permutation and the
+        adjustment is part of the procedure being tested, not held fixed.
 
     Returns oof_preds (n_samples × n_targets).
     """
@@ -402,11 +601,20 @@ def run_fixed_cv(X, y, model_name, best_params, param_grid_path, n_folds, seed,
     outer_cv  = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
     oof_preds = np.full_like(y, np.nan, dtype=float)
 
-    is_indep = isinstance(best_params, list)
+    if per_target_fit is None:
+        per_target_fit = isinstance(best_params, list)
 
     for tr_idx, te_idx in outer_cv.split(X):
         X_tr_full, X_te_full = X[tr_idx], X[te_idx]
         y_tr = y[tr_idx]
+
+        if covariate_df is not None and (train_only_covs or train_test_covs):
+            samples_tr = [samples[i] for i in tr_idx]
+            samples_te = [samples[i] for i in te_idx]
+            X_tr_full, X_te_full, _ = regress_out_covariates(
+                X_tr_full, X_te_full, covariate_df, samples_tr, samples_te,
+                train_only_covs, train_test_covs,
+            )
 
         if n_gene_features is not None:
             hvg_idx_local = select_hvgs(X_tr_full[:, :n_gene_features], hvg_pct, hvg_max)
@@ -421,10 +629,11 @@ def run_fixed_cv(X, y, model_name, best_params, param_grid_path, n_folds, seed,
         X_tr_sc = scaler.fit_transform(X_tr)
         X_te_sc = scaler.transform(X_te)
 
-        if is_indep:
+        if per_target_fit:
             for j in range(n_targets):
-                base, _ = build_estimator(model_name, param_grid_path, seed)
-                base.set_params(**best_params[j])
+                base, _   = build_estimator(model_name, param_grid_path, seed)
+                params_j  = best_params[j] if isinstance(best_params, list) else best_params
+                base.set_params(**params_j)
                 base.fit(X_tr_sc, y_tr[:, j])
                 oof_preds[te_idx, j] = base.predict(X_te_sc)
         else:
@@ -480,17 +689,19 @@ def combine_fold_importances(all_imps, n_total_features):
 def run_nested_cv_independent(X, y, model_name, base, grid,
                               n_outer, n_inner, n_iter, seed, feature_names,
                               target_names=None, n_jobs_outer=1, n_jobs_inner=1,
-                              n_gene_features=None, hvg_pct=None, hvg_max=None):
+                              n_gene_features=None, hvg_pct=None, hvg_max=None,
+                              samples=None, covariate_df=None,
+                              train_only_covs=None, train_test_covs=None):
     """Fit one independent single-output model per target column, instead of a
     joint multi-task fit — no shared feature support is enforced across targets.
 
     Reuses run_nested_cv_tree once per column. KFold splitting (and, if
-    n_gene_features is given, the per-fold HVG reselection) in
-    run_nested_cv_tree depends only on X and `seed` (not y), so outer-fold
-    membership AND each fold's selected gene columns are identical across
-    targets — letting per-fold importances recombine into the same
-    (n_targets, n_features) shape the joint MultiTaskElasticNet/MultiTaskLasso
-    models produce.
+    n_gene_features is given, the per-fold HVG reselection, and any covariate
+    regression) in run_nested_cv_tree depends only on X, `seed`, samples, and
+    covariate_df (not y), so outer-fold membership AND each fold's selected
+    gene columns/covariate adjustment are identical across targets — letting
+    per-fold importances recombine into the same (n_targets, n_features) shape
+    the joint MultiTaskElasticNet/MultiTaskLasso models produce.
 
     Returns fold_metrics (each dict tagged with 'archetype'), oof_preds
     (n_samples × n_targets), and all_imps — a list of (sel_idx, imp) tuples,
@@ -510,6 +721,8 @@ def run_nested_cv_independent(X, y, model_name, base, grid,
             n_outer, n_inner, n_iter, seed, feature_names,
             n_jobs_outer=n_jobs_outer, n_jobs_inner=n_jobs_inner,
             n_gene_features=n_gene_features, hvg_pct=hvg_pct, hvg_max=hvg_max,
+            samples=samples, covariate_df=covariate_df,
+            train_only_covs=train_only_covs, train_test_covs=train_test_covs,
         )
         for m in fm_j:
             m["archetype"] = target_names[j]
