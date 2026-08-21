@@ -4,7 +4,8 @@ Shared utility functions and classes for the archetype classification pipeline.
 
 Sections:
   1. Data I/O          — load_pseudobulk, load_mil_bags
-  2. Feature prep      — filter_lowly_expressed_genes, select_hvgs, pseudobulk_aggregate,
+  2. Feature prep      — filter_lowly_expressed_genes, select_hvgs,
+                         select_hvgs_confound_aware, pseudobulk_aggregate,
                          compute_abundance, get_archetype_weight_cols
   2b. Covariate regression — split_covariate_names, load_meta_file,
                          validate_covariate_lists, fit_covariate_design,
@@ -123,6 +124,86 @@ def select_hvgs(pb_matrix, hvg_pct, hvg_max):
     return np.sort(idx)
 
 
+def _explained_variance_ratio(design, coef, gene_matrix):
+    """Fraction of each gene's (column's) variance explained by `design @ coef.T`
+    — shared helper for covariate_r2-style and target_r2-style computations
+    (see select_hvgs_confound_aware)."""
+    fitted    = design @ coef.T
+    total_var = gene_matrix.var(axis=0)
+    return np.clip(fitted.var(axis=0) / np.maximum(total_var, 1e-12), 0, 1)
+
+
+def select_hvgs_confound_aware(gene_matrix, y_train, df_meta, samples_train,
+                               confound_covs, hvg_pct, hvg_max, eps=1e-4):
+    """Select HVG candidates by target_r2^2 / covariate_r2 instead of raw
+    variance — see temp/hvg_selection.txt for the full derivation, the
+    alternatives considered and rejected, and validation across every
+    cluster/archetype available.
+
+    target_r2_j    = fraction of gene j's variance explained by y_train
+                      (fit gene ~ y_train; single- or multi-column y_train
+                      both work, via the same variance-decomposition used for
+                      covariate_r2 — this is what makes HVG panels come out
+                      target-specific for models fit one target at a time,
+                      e.g. elasticnet_indep/lasso_indep via
+                      run_nested_cv_independent, and shared/joint for models
+                      fit on the full target matrix at once).
+    covariate_r2_j = fraction of gene j's variance explained by confound_covs.
+
+    Ranks by target_r2^2 / (covariate_r2 + eps): squaring target_r2 in the
+    numerator matters — a plain ratio over-rewards genes that are merely
+    unconfounded (tiny covariate_r2) even with weak absolute signal; squaring
+    requires real absolute target signal to survive dividing by a small
+    covariate_r2 too. Validated empirically to keep strongly-informative,
+    moderately-confounded genes (e.g. CD83) while still excluding the most
+    confounded, weakly-informative ones (e.g. JUN) — a plain ratio wrongly
+    drops the former.
+
+    Computed entirely on RAW (pre-covariate-residualization) gene values —
+    covariate_r2 must reflect each gene's true, unadjusted confound exposure
+    to be meaningful; computing it after residualizing would be vacuous,
+    since residualizing removes exactly that component. Callers now select
+    HVGs before any residualization happens at all (see _fit_outer_fold/
+    run_fixed_cv), so `gene_matrix` here is simply the fold's raw training
+    gene block, not a value specially held back for this function.
+
+    confound_covs is whatever the caller decides genes should be scored
+    against — by convention (see _fit_outer_fold/run_fixed_cv/
+    006_finalize_model.py) this is train_only_covs if non-empty, else
+    train_test_covs: originally this ranking was scoped to train_only_covs
+    only, because only those covariates created an asymmetric train/test
+    miscalibration risk worth actively guarding against in selection: once
+    train_only_covs is empty (all covariates residualized symmetrically,
+    fit-on-train/apply-to-test), that risk is gone for everything, and the
+    remaining reason to keep this ranking at all is spending a necessarily
+    limited HVG budget on genes whose OWN variance is more attributable to
+    the phenotype than to any of the covariates being cleaned — which is just
+    as true of train_test_covs as it ever was of train_only_covs.
+
+    Returns sorted gene indices, same contract as select_hvgs.
+    """
+    if not confound_covs:
+        raise ValueError(
+            "hvg_select_method='sq_target_vs_technical' requires a non-empty "
+            "confound_covs (train_only_covs, or train_test_covs if "
+            "train_only_covs is empty) — it ranks genes by target signal "
+            "relative to covariate confound exposure, which is undefined "
+            "without at least one non-empty covariate list."
+        )
+    design, _ = fit_covariate_design(df_meta, samples_train, confound_covs)
+    reg_cov   = LinearRegression().fit(design, gene_matrix)
+    covariate_r2 = _explained_variance_ratio(design, reg_cov.coef_, gene_matrix)
+
+    y2 = y_train if y_train.ndim > 1 else y_train.reshape(-1, 1)
+    reg_target = LinearRegression().fit(y2, gene_matrix)
+    target_r2  = _explained_variance_ratio(y2, reg_target.coef_, gene_matrix)
+
+    score = target_r2**2 / (covariate_r2 + eps)
+    n_hvg = min(hvg_max, max(1, int(gene_matrix.shape[1] * hvg_pct)))
+    idx   = np.argsort(score)[::-1][:n_hvg]
+    return np.sort(idx)
+
+
 def pseudobulk_aggregate(adata_cluster, sample_col, agg="mean"):
     """Aggregate per-cell expression to per-sample pseudo-bulk.
 
@@ -215,11 +296,16 @@ def apply_label_mode(y, mode, min_score=0.5):
 
 
 # ─── 2b. Technical covariate regression ──────────────────────────────────────
-# Removes technical-covariate effects from pseudobulk features BEFORE HVG
-# selection, since select_hvgs ranks genes by raw variance — a covariate that
-# inflates variance in biologically uninformative genes can otherwise crowd
-# out real signal from the HVG panel. Two distinct regimes, matching whether a
-# covariate will be available/meaningful for genuinely external data:
+# Removes technical-covariate effects from pseudobulk features AFTER HVG
+# selection but before model fitting (see _fit_outer_fold/run_fixed_cv/
+# 006_finalize_model.py) — HVG selection itself always runs on raw,
+# pre-regression values (required for "sq_target_vs_technical", whose
+# covariate_r2 would be vacuous post-residualization; harmless for "default",
+# and regressing only the selected columns afterward is cheaper than
+# regressing the full candidate-gene matrix, since regression is
+# column-independent — same result, less compute). Two distinct regimes,
+# matching whether a covariate will be available/meaningful for genuinely
+# external data:
 #   train_only_covs — regressed out of the TRAINING rows only; the held-out
 #     fold (or, in 006_finalize_model.py, any future external sample) is left
 #     untouched, and the fitted model is never persisted. For covariates that
@@ -423,7 +509,8 @@ def _fit_outer_fold(fold_i, tr_idx, te_idx, X, y, estimator, search_grid,
                     n_inner, n_iter, seed, n_jobs_inner, n_targets,
                     n_gene_features=None, hvg_pct=None, hvg_max=None,
                     samples=None, covariate_df=None,
-                    train_only_covs=None, train_test_covs=None):
+                    train_only_covs=None, train_test_covs=None,
+                    hvg_select_method="default"):
     """Run one outer CV fold: inner HPO search + refit + predict. Used by run_nested_cv_tree.
 
     If n_gene_features is given, HVGs are reselected here from X_tr's gene
@@ -431,30 +518,55 @@ def _fit_outer_fold(fold_i, tr_idx, te_idx, X, y, estimator, search_grid,
     never ranked using samples that end up in the held-out test fold. Columns
     at/after n_gene_features (abundance features) are always kept as-is.
 
+    HVG selection always happens FIRST, on the fold's raw (pre-regression)
+    training data, then covariate regression runs only on the selected
+    columns — see the module comment above section 2b for why this ordering
+    is equivalent to regressing the full matrix first and subsetting after
+    (regression is column-independent) while being cheaper (fewer columns to
+    regress) and required for "sq_target_vs_technical" specifically, since
+    its covariate_r2 must reflect each gene's true, unadjusted confound
+    exposure — computing it post-residualization would be vacuous.
+
+    hvg_select_method: "default" ranks candidate genes by raw variance, via
+    select_hvgs. "sq_target_vs_technical" ranks by target_r2^2/covariate_r2
+    instead, via select_hvgs_confound_aware, scored against train_only_covs
+    if non-empty, else train_test_covs (see select_hvgs_confound_aware's
+    confound_covs docstring for why). See temp/hvg_selection.txt for the full
+    derivation/validation.
+
     If covariate_df is given (with samples aligned to X's row order), technical
-    covariates are regressed out BEFORE HVG selection — see regress_out_covariates
-    and the section 2b module comment for the train_only_covs/train_test_covs
-    distinction. Fit-and-discarded per fold, same lifecycle as the scaler below.
+    covariates are regressed out of the selected columns — see
+    regress_out_covariates and the section 2b module comment for the
+    train_only_covs/train_test_covs distinction. Fit-and-discarded per fold,
+    same lifecycle as the scaler below.
     """
     X_tr_full, X_te_full = X[tr_idx], X[te_idx]
     y_tr, y_te = y[tr_idx], y[te_idx]
 
-    if covariate_df is not None and (train_only_covs or train_test_covs):
-        samples_tr = [samples[i] for i in tr_idx]
-        samples_te = [samples[i] for i in te_idx]
-        X_tr_full, X_te_full, _ = regress_out_covariates(
-            X_tr_full, X_te_full, covariate_df, samples_tr, samples_te,
-            train_only_covs, train_test_covs,
-        )
+    samples_tr = [samples[i] for i in tr_idx] if samples is not None else None
+    samples_te = [samples[i] for i in te_idx] if samples is not None else None
 
     if n_gene_features is not None:
-        hvg_idx_local = select_hvgs(X_tr_full[:, :n_gene_features], hvg_pct, hvg_max)
+        if hvg_select_method == "sq_target_vs_technical":
+            confound_covs = train_only_covs if train_only_covs else train_test_covs
+            hvg_idx_local = select_hvgs_confound_aware(
+                X_tr_full[:, :n_gene_features], y_tr, covariate_df, samples_tr,
+                confound_covs, hvg_pct, hvg_max,
+            )
+        else:
+            hvg_idx_local = select_hvgs(X_tr_full[:, :n_gene_features], hvg_pct, hvg_max)
         abund_idx     = np.arange(n_gene_features, X_tr_full.shape[1])
         sel_idx       = np.concatenate([hvg_idx_local, abund_idx])
     else:
         sel_idx = np.arange(X_tr_full.shape[1])
 
     X_tr, X_te = X_tr_full[:, sel_idx], X_te_full[:, sel_idx]
+
+    if covariate_df is not None and (train_only_covs or train_test_covs):
+        X_tr, X_te, _ = regress_out_covariates(
+            X_tr, X_te, covariate_df, samples_tr, samples_te,
+            train_only_covs, train_test_covs,
+        )
 
     scaler   = StandardScaler()
     X_tr_sc  = scaler.fit_transform(X_tr)
@@ -505,7 +617,8 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
                        n_jobs_outer=1, n_jobs_inner=1,
                        n_gene_features=None, hvg_pct=None, hvg_max=None,
                        samples=None, covariate_df=None,
-                       train_only_covs=None, train_test_covs=None):
+                       train_only_covs=None, train_test_covs=None,
+                       hvg_select_method="default"):
     """Nested CV for XGBoost (indep/joint) / RF / ElasticNet / Lasso with RandomizedSearchCV inner loop.
 
     n_jobs_outer : parallel outer folds (set to n_outer for max parallelism;
@@ -514,10 +627,16 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
     n_gene_features, hvg_pct, hvg_max : if n_gene_features is given, HVGs are
         reselected per outer fold from that fold's training samples only (see
         _fit_outer_fold) instead of using a fixed pre-selected panel.
+    hvg_select_method : "default" (variance-based, select_hvgs) or
+        "sq_target_vs_technical" (target_r2^2/covariate_r2, select_hvgs_confound_aware
+        — see _fit_outer_fold and temp/hvg_selection.txt). Passing `y` here as
+        a single column (as run_nested_cv_independent does, once per target)
+        naturally gives each target its own HVG panel under the confound-aware
+        method; passing the full multi-column y gives one shared panel.
     samples, covariate_df, train_only_covs, train_test_covs : if covariate_df
         is given (samples aligned to X's row order), technical covariates are
-        regressed out per outer fold before HVG selection — see
-        regress_out_covariates and the section 2b module comment.
+        regressed out per outer fold — see regress_out_covariates and the
+        section 2b module comment.
     Returns fold_metrics list, oof_preds (n_samples × n_targets), and all_imps
     — a list of (sel_idx, imp) tuples, one per outer fold, since fold-specific
     HVG reselection means different folds may keep different gene columns.
@@ -543,6 +662,7 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
             n_gene_features=n_gene_features, hvg_pct=hvg_pct, hvg_max=hvg_max,
             samples=samples, covariate_df=covariate_df,
             train_only_covs=train_only_covs, train_test_covs=train_test_covs,
+            hvg_select_method=hvg_select_method,
         )
         for fold_i, (tr_idx, te_idx) in enumerate(outer_cv.split(X))
     )
@@ -562,7 +682,8 @@ def run_nested_cv_tree(X, y, model_name, base, grid,
 
 def run_fixed_cv(X, y, model_name, best_params, param_grid_path, n_folds, seed,
                  n_gene_features=None, hvg_pct=None, hvg_max=None, per_target_fit=None,
-                 samples=None, covariate_df=None, train_only_covs=None, train_test_covs=None):
+                 samples=None, covariate_df=None, train_only_covs=None, train_test_covs=None,
+                 hvg_select_method="default"):
     """Plain (non-nested) K-fold CV with FIXED hyperparameters — no inner search.
 
     Used for permutation-null testing (007_permutation_null.py): the expensive
@@ -594,6 +715,17 @@ def run_fixed_cv(X, y, model_name, best_params, param_grid_path, n_folds, seed,
         module comment) — refit fresh every call, same as HVG reselection,
         since 007_permutation_null.py calls this once per permutation and the
         adjustment is part of the procedure being tested, not held fixed.
+    hvg_select_method : "default" or "sq_target_vs_technical" — see
+        _fit_outer_fold and temp/hvg_selection.txt. Under the confound-aware
+        method, HVG selection is reselected PER TARGET inside the
+        per_target_fit loop for elasticnet_indep/lasso_indep (matching
+        run_nested_cv_independent's real behavior: each target's own y column
+        informs its own gene panel) — EXCEPT for xgboost_indep, which keeps
+        one shared panel selected once per fold, because in the real pipeline
+        xgboost_indep's independent-per-target fitting happens inside a
+        single MultiOutputRegressor wrapping one shared _fit_outer_fold call,
+        not via separate per-target calls — this replicates that shared-panel
+        behavior rather than the run_nested_cv_independent one.
 
     Returns oof_preds (n_samples × n_targets).
     """
@@ -603,39 +735,67 @@ def run_fixed_cv(X, y, model_name, best_params, param_grid_path, n_folds, seed,
 
     if per_target_fit is None:
         per_target_fit = isinstance(best_params, list)
+    per_target_hvg = (per_target_fit and model_name != "xgboost_indep"
+                      and hvg_select_method == "sq_target_vs_technical")
 
     for tr_idx, te_idx in outer_cv.split(X):
         X_tr_full, X_te_full = X[tr_idx], X[te_idx]
         y_tr = y[tr_idx]
 
-        if covariate_df is not None and (train_only_covs or train_test_covs):
-            samples_tr = [samples[i] for i in tr_idx]
-            samples_te = [samples[i] for i in te_idx]
-            X_tr_full, X_te_full, _ = regress_out_covariates(
-                X_tr_full, X_te_full, covariate_df, samples_tr, samples_te,
-                train_only_covs, train_test_covs,
-            )
+        samples_tr = [samples[i] for i in tr_idx] if samples is not None else None
+        samples_te = [samples[i] for i in te_idx] if samples is not None else None
 
-        if n_gene_features is not None:
-            hvg_idx_local = select_hvgs(X_tr_full[:, :n_gene_features], hvg_pct, hvg_max)
-            abund_idx     = np.arange(n_gene_features, X_tr_full.shape[1])
-            sel_idx       = np.concatenate([hvg_idx_local, abund_idx])
-        else:
-            sel_idx = np.arange(X_tr_full.shape[1])
+        def _select(y_for_hvg):
+            """HVG selection on the fold's RAW (pre-regression) training data
+            — see the _fit_outer_fold docstring for why selection always
+            precedes covariate regression now."""
+            if n_gene_features is None:
+                return np.arange(X_tr_full.shape[1])
+            if hvg_select_method == "sq_target_vs_technical":
+                confound_covs = train_only_covs if train_only_covs else train_test_covs
+                hvg_idx_local = select_hvgs_confound_aware(
+                    X_tr_full[:, :n_gene_features], y_for_hvg, covariate_df, samples_tr,
+                    confound_covs, hvg_pct, hvg_max,
+                )
+            else:
+                hvg_idx_local = select_hvgs(X_tr_full[:, :n_gene_features], hvg_pct, hvg_max)
+            abund_idx = np.arange(n_gene_features, X_tr_full.shape[1])
+            return np.concatenate([hvg_idx_local, abund_idx])
 
-        X_tr, X_te = X_tr_full[:, sel_idx], X_te_full[:, sel_idx]
+        def _residualize(sel_idx):
+            """Subset to sel_idx, then regress out covariates from just that
+            subset — equivalent to regressing the full matrix first (regression
+            is column-independent) but cheaper."""
+            X_tr_s, X_te_s = X_tr_full[:, sel_idx], X_te_full[:, sel_idx]
+            if covariate_df is not None and (train_only_covs or train_test_covs):
+                X_tr_s, X_te_s, _ = regress_out_covariates(
+                    X_tr_s, X_te_s, covariate_df, samples_tr, samples_te,
+                    train_only_covs, train_test_covs,
+                )
+            return X_tr_s, X_te_s
 
-        scaler  = StandardScaler()
-        X_tr_sc = scaler.fit_transform(X_tr)
-        X_te_sc = scaler.transform(X_te)
+        if not per_target_hvg:
+            sel_idx = _select(y_tr)
+            X_tr, X_te = _residualize(sel_idx)
+            scaler  = StandardScaler()
+            X_tr_sc = scaler.fit_transform(X_tr)
+            X_te_sc = scaler.transform(X_te)
 
         if per_target_fit:
             for j in range(n_targets):
+                if per_target_hvg:
+                    sel_idx_j = _select(y_tr[:, j:j + 1])
+                    X_tr_j, X_te_j = _residualize(sel_idx_j)
+                    scaler_j   = StandardScaler()
+                    X_tr_sc_j  = scaler_j.fit_transform(X_tr_j)
+                    X_te_sc_j  = scaler_j.transform(X_te_j)
+                else:
+                    X_tr_sc_j, X_te_sc_j = X_tr_sc, X_te_sc
                 base, _   = build_estimator(model_name, param_grid_path, seed)
                 params_j  = best_params[j] if isinstance(best_params, list) else best_params
                 base.set_params(**params_j)
-                base.fit(X_tr_sc, y_tr[:, j])
-                oof_preds[te_idx, j] = base.predict(X_te_sc)
+                base.fit(X_tr_sc_j, y_tr[:, j])
+                oof_preds[te_idx, j] = base.predict(X_te_sc_j)
         else:
             base, _ = build_estimator(model_name, param_grid_path, seed)
             base.set_params(**best_params)
@@ -691,21 +851,35 @@ def run_nested_cv_independent(X, y, model_name, base, grid,
                               target_names=None, n_jobs_outer=1, n_jobs_inner=1,
                               n_gene_features=None, hvg_pct=None, hvg_max=None,
                               samples=None, covariate_df=None,
-                              train_only_covs=None, train_test_covs=None):
+                              train_only_covs=None, train_test_covs=None,
+                              hvg_select_method="default"):
     """Fit one independent single-output model per target column, instead of a
     joint multi-task fit — no shared feature support is enforced across targets.
 
-    Reuses run_nested_cv_tree once per column. KFold splitting (and, if
-    n_gene_features is given, the per-fold HVG reselection, and any covariate
-    regression) in run_nested_cv_tree depends only on X, `seed`, samples, and
-    covariate_df (not y), so outer-fold membership AND each fold's selected
-    gene columns/covariate adjustment are identical across targets — letting
-    per-fold importances recombine into the same (n_targets, n_features) shape
-    the joint MultiTaskElasticNet/MultiTaskLasso models produce.
+    Reuses run_nested_cv_tree once per column, passing that column alone as y
+    each time. KFold splitting depends only on X and `seed` (not y), so
+    outer-fold membership is identical across targets regardless of
+    hvg_select_method.
+
+    HVG selection is NOT necessarily identical across targets, though:
+    - hvg_select_method="default" doesn't depend on y at all (variance-based),
+      so every target's fold still gets the same gene panel.
+    - hvg_select_method="sq_target_vs_technical" DOES depend on y (target_r2
+      is computed against whichever y run_nested_cv_tree is given — here,
+      one column at a time), so each target legitimately gets its own,
+      differently-selected gene panel per fold. This is intentional — see
+      temp/hvg_selection.txt — but it means per-target importances can no
+      longer be safely stacked under one shared sel_idx.
 
     Returns fold_metrics (each dict tagged with 'archetype'), oof_preds
-    (n_samples × n_targets), and all_imps — a list of (sel_idx, imp) tuples,
-    one per outer fold, matching run_nested_cv_tree's contract.
+    (n_samples × n_targets), and per_target_imps — a list of length
+    n_targets, each element itself a list of (sel_idx, imp) tuples (one per
+    outer fold), i.e. run_nested_cv_tree's own all_imps for that target,
+    unmodified. Combine each target's list separately with
+    combine_fold_importances(), then stack the resulting (n_total_features,)
+    vectors into (n_targets, n_total_features) — do NOT assume a shared
+    sel_idx across targets the way run_nested_cv_tree's own all_imps allows
+    (see 002_train_tree_models.py for the reference implementation of this).
     """
     n_targets = y.shape[1]
     if target_names is None:
@@ -723,6 +897,7 @@ def run_nested_cv_independent(X, y, model_name, base, grid,
             n_gene_features=n_gene_features, hvg_pct=hvg_pct, hvg_max=hvg_max,
             samples=samples, covariate_df=covariate_df,
             train_only_covs=train_only_covs, train_test_covs=train_test_covs,
+            hvg_select_method=hvg_select_method,
         )
         for m in fm_j:
             m["archetype"] = target_names[j]
@@ -730,14 +905,7 @@ def run_nested_cv_independent(X, y, model_name, base, grid,
         oof_preds[:, j] = oof_j.ravel()
         per_target_imps.append(imps_j)  # list of (sel_idx, imp) per outer fold
 
-    all_imps = []
-    if per_target_imps and all(len(imps) == n_outer for imps in per_target_imps):
-        for fold_i in range(n_outer):
-            sel_idx_0, _ = per_target_imps[0][fold_i]
-            stacked = np.vstack([per_target_imps[j][fold_i][1].ravel() for j in range(n_targets)])
-            all_imps.append((sel_idx_0, stacked))
-
-    return fold_metrics, oof_preds, all_imps
+    return fold_metrics, oof_preds, per_target_imps
 
 
 # ─── 4. MIL ───────────────────────────────────────────────────────────────────

@@ -23,9 +23,12 @@ Design:
   - HVGs are still reselected fresh per outer fold, per permutation, from that
     fold's training data only (helpers.run_fixed_cv / select_hvgs) — this is
     NOT part of what gets fixed, it's cheap and remains part of the procedure
-    being tested. Technical covariate regression (--meta_file /
-    --train_only_covs / --train_test_covs), if enabled for the real analysis,
-    is refit fresh per permutation the same way — see helpers.regress_out_covariates.
+    being tested. --hvg_select_method must match whatever the real
+    002_train_tree_models.py run used (see helpers.select_hvgs_confound_aware),
+    or this isn't testing the same procedure. Technical covariate regression
+    (--meta_file / --train_only_covs / --train_test_covs), if enabled for the
+    real analysis, is refit fresh per permutation the same way — see
+    helpers.regress_out_covariates.
   - y is permuted row-wise as ONE consistent shuffle across all target columns
     (not independently per column), breaking the sample-level X<->y
     correspondence while preserving whatever structure exists across targets.
@@ -137,6 +140,10 @@ def parse_args():
                         "002_train_tree_models.py run used, if it used covariate regression.")
     p.add_argument("--train_only_covs",     nargs="*", default=[])
     p.add_argument("--train_test_covs",     nargs="*", default=[])
+    p.add_argument("--hvg_select_method",   default="default",
+                   choices=["default", "sq_target_vs_technical"],
+                   help="Must match whatever the real 002_train_tree_models.py run used — "
+                        "see helpers.select_hvgs_confound_aware and temp/hvg_selection.txt.")
     p.add_argument("--outdir",              required=True)
     return p.parse_args()
 
@@ -208,6 +215,14 @@ def main():
     args = parse_args()
     args.train_only_covs = split_covariate_names(args.train_only_covs)
     args.train_test_covs = split_covariate_names(args.train_test_covs)
+    if args.hvg_select_method == "sq_target_vs_technical" and not (args.train_only_covs or args.train_test_covs):
+        raise ValueError(
+            "--hvg_select_method sq_target_vs_technical requires a non-empty "
+            "--train_only_covs or --train_test_covs (it ranks genes by target "
+            "signal relative to covariate confound exposure — scored against "
+            "--train_only_covs if given, else --train_test_covs — which is "
+            "undefined without at least one)."
+        )
     os.makedirs(args.outdir, exist_ok=True)
 
     print(f"Loading pseudo-bulk from {args.pseudobulk}")
@@ -269,6 +284,7 @@ def main():
         per_target_fit=(model_name in _PER_TARGET_FIT_MODELS),
         samples=samples, covariate_df=df_meta,
         train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
+        hvg_select_method=args.hvg_select_method,
     )
     observed_r2 = _per_pc_r2(y, oof_observed)
     for col, r2 in zip(arch_cols, observed_r2):
@@ -290,6 +306,7 @@ def main():
             per_target_fit=(model_name in _PER_TARGET_FIT_MODELS),
             samples=samples, covariate_df=df_meta,
             train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
+            hvg_select_method=args.hvg_select_method,
         )
         r2_i = _per_pc_r2(y_perm, oof_perm)
         null_r2[i] = r2_i

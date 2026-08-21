@@ -190,7 +190,13 @@ def main():
                                      f"{model_name}_{label_mode}_feature_importance.pdf"), dpi=150)
             plt.close()
         else:
-            coef_cols = [c for c in df_imp.columns if c not in ("feature", "n_folds_selected")]
+            # "n_folds_selected" for joint linear models (one shared HVG panel
+            # across targets); "n_folds_selected_{archetype}" for
+            # elasticnet_indep/lasso_indep under hvg_select_method=
+            # "sq_target_vs_technical" (each archetype can get its own panel —
+            # see run_nested_cv_independent) — exclude both by prefix.
+            coef_cols = [c for c in df_imp.columns
+                        if c != "feature" and not c.startswith("n_folds_selected")]
             n = len(coef_cols)
             if n == 0:
                 continue

@@ -74,6 +74,30 @@ Technical covariate regression (--meta_file / --train_only_covs / --train_test_c
   comment in helpers.py for the train_only_covs vs train_test_covs
   distinction (whether the fitted adjustment is also applied to the held-out
   fold, vs. train-only and discarded). Both default to empty (no adjustment).
+
+HVG selection method (--hvg_select_method): selection always runs on RAW,
+pre-covariate-regression values now, with covariates only regressed out of
+whichever columns get selected afterward (see helpers._fit_outer_fold's
+docstring — regression is column-independent, so this is equivalent to
+regressing everything first and subsetting after, just cheaper).
+  "default"               — rank candidate genes by raw variance, via
+                             helpers.select_hvgs (original behaviour, though
+                             note it now sees raw rather than
+                             covariate-residualized values — see above).
+  "sq_target_vs_technical" — rank by target_r2^2/covariate_r2 instead, via
+                             helpers.select_hvgs_confound_aware. Scored
+                             against --train_only_covs if non-empty, else
+                             --train_test_covs — requires at least one of the
+                             two to be non-empty. See temp/hvg_selection.txt
+                             for the full derivation, the alternatives
+                             considered and rejected, and validation across
+                             every cluster/archetype available. For
+                             elasticnet_indep/lasso_indep this naturally
+                             gives each archetype its own gene panel
+                             (target_r2 is computed against that target's own
+                             column); for every other model, one shared panel
+                             (computed against the full target matrix, or via
+                             MultiOutputRegressor for xgboost_indep).
 """
 # TESTING: module load HGI/softpack/users/eh19/BioAUTOMATED/1
 # module load cuda-12.1.1
@@ -156,6 +180,13 @@ def parse_args():
                         "training AND held-out fold (fit on train, applied to test) — "
                         "for covariates measurable identically in any dataset, e.g. "
                         "total_counts/n_genes_expressed. See helpers.regress_out_covariates.")
+    p.add_argument("--hvg_select_method", default="default",
+                   choices=["default", "sq_target_vs_technical"],
+                   help="'default': rank HVG candidates by raw variance. "
+                        "'sq_target_vs_technical': rank by target_r2^2/covariate_r2 "
+                        "instead, scored against --train_only_covs if non-empty else "
+                        "--train_test_covs (requires at least one non-empty) — see "
+                        "helpers.select_hvgs_confound_aware and temp/hvg_selection.txt.")
 
     # ── Interactive testing ───────────────────────────────────────────────────
     # Uncomment the block below and swap `return p.parse_args()` → `return args`
@@ -186,6 +217,7 @@ def parse_args():
          meta_file       = None,
          train_only_covs = [],
          train_test_covs = [],
+         hvg_select_method = "default",
     )
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -211,7 +243,7 @@ def _run_one_model(model_name, args, estimator_n_jobs, X, y, arch_cols, samples,
                                  n_jobs=estimator_n_jobs, device=device)
     print(f"\n{'='*40}\n{model_name.upper()}", flush=True)
     if model_name in ("elasticnet_indep", "lasso_indep"):
-        fold_metrics, oof_preds, all_imps = run_nested_cv_independent(
+        fold_metrics, oof_preds, per_target_imps = run_nested_cv_independent(
             X, y, model_name, base, grid,
             args.n_outer_folds, args.n_inner_folds, args.n_iter,
             args.seed, feature_names, target_names=arch_cols,
@@ -220,7 +252,14 @@ def _run_one_model(model_name, args, estimator_n_jobs, X, y, arch_cols, samples,
             n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
             samples=samples, covariate_df=df_meta,
             train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
+            hvg_select_method=args.hvg_select_method,
         )
+        # per_target_imps: list of length n_targets, each its own (sel_idx, imp)-
+        # per-fold list — NOT pre-stacked, since hvg_select_method=
+        # "sq_target_vs_technical" can select a different gene panel per target
+        # (see run_nested_cv_independent's docstring). Caller must combine each
+        # target separately, not assume a shared sel_idx.
+        return model_name, fold_metrics, oof_preds, per_target_imps
     else:
         fold_metrics, oof_preds, all_imps = run_nested_cv_tree(
             X, y, model_name, base, grid,
@@ -231,8 +270,9 @@ def _run_one_model(model_name, args, estimator_n_jobs, X, y, arch_cols, samples,
             n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
             samples=samples, covariate_df=df_meta,
             train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
+            hvg_select_method=args.hvg_select_method,
         )
-    return model_name, fold_metrics, oof_preds, all_imps
+        return model_name, fold_metrics, oof_preds, all_imps
 
 
 def main():
@@ -262,6 +302,15 @@ def main():
     samples = [samples[i] for i in keep_idx]
     y = df_tgt.loc[samples].values.astype(float)
     arch_cols = df_tgt.columns.tolist()
+
+    if args.hvg_select_method == "sq_target_vs_technical" and not (args.train_only_covs or args.train_test_covs):
+        raise ValueError(
+            "--hvg_select_method sq_target_vs_technical requires a non-empty "
+            "--train_only_covs or --train_test_covs (it ranks genes by target "
+            "signal relative to covariate confound exposure — scored against "
+            "--train_only_covs if given, else --train_test_covs — which is "
+            "undefined without at least one)."
+        )
 
     df_meta = None
     if args.train_only_covs or args.train_test_covs:
@@ -319,7 +368,26 @@ def main():
         pd.DataFrame([overall]).to_csv(
             f"{args.outdir}/{model_name}_overall_metrics.csv", index=False)
 
-        if all_imps:
+        if model_name in ("elasticnet_indep", "lasso_indep"):
+            # all_imps here is actually per_target_imps (see run_nested_cv_independent):
+            # one (sel_idx, imp)-per-fold list PER TARGET, not pre-stacked, because
+            # hvg_select_method="sq_target_vs_technical" can select a different gene
+            # panel per target. Combine each target separately, then stack — never
+            # assume a shared sel_idx across targets the way the joint-model branch
+            # below does.
+            per_target_mean_imp, per_target_n_sel = [], []
+            for imps_j in all_imps:
+                mean_imp_j, n_sel_j = combine_fold_importances(imps_j, len(feature_names))
+                per_target_mean_imp.append(mean_imp_j)
+                per_target_n_sel.append(n_sel_j)
+            if all(m is not None for m in per_target_mean_imp):
+                mean_imp_filled = np.nan_to_num(np.vstack(per_target_mean_imp))  # (n_targets, n_features)
+                df_imp = (pd.DataFrame(mean_imp_filled.T, index=feature_names, columns=arch_cols)
+                            .rename_axis("feature"))
+                for j, col in enumerate(arch_cols):
+                    df_imp[f"n_folds_selected_{col}"] = per_target_n_sel[j]
+                df_imp.to_csv(f"{args.outdir}/{model_name}_feature_importances.csv")
+        elif all_imps:
             # Fold-specific HVG reselection means different outer folds may have
             # kept different gene columns; combine_fold_importances scatters each
             # fold's importances onto the full feature axis (NaN where a gene
@@ -334,8 +402,10 @@ def main():
                    .sort_values("importance", ascending=False)
                    .to_csv(f"{args.outdir}/{model_name}_feature_importances.csv", index=False))
             else:
-                # Joint multi-task and independent-per-target linear models both
-                # produce mean_imp as (n_targets, n_features). Keep one signed
+                # Joint multi-task linear models produce mean_imp as
+                # (n_targets, n_features), one shared sel_idx across targets
+                # (they fit all targets from one shared feature panel, unlike
+                # elasticnet_indep/lasso_indep above). Keep one signed
                 # coefficient column per archetype so individual clr_pca targets
                 # can still be traced back to informative genes.
                 df_imp = (pd.DataFrame(mean_imp_filled.T, index=feature_names, columns=arch_cols)

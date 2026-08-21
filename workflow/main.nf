@@ -127,6 +127,7 @@ process TRAIN_TREE_MODELS {
         ${meta_arg} \\
         --train_only_covs  ${params.train_only_covs} \\
         --train_test_covs  ${params.train_test_covs} \\
+        --hvg_select_method ${params.hvg_select_method} \\
         --outdir           ${cluster}_${model}_${label_mode}_tree
     """
 }
@@ -180,6 +181,7 @@ process TRAIN_XGBOOST_JOINT {
         ${meta_arg} \\
         --train_only_covs  ${params.train_only_covs} \\
         --train_test_covs  ${params.train_test_covs} \\
+        --hvg_select_method ${params.hvg_select_method} \\
         --n_jobs_models    1 \\
         --outdir           ${cluster}_xgboost_joint_${label_mode}_tree
     """
@@ -232,6 +234,7 @@ process PERMUTATION_NULL {
         ${meta_arg} \\
         --train_only_covs ${params.train_only_covs} \\
         --train_test_covs ${params.train_test_covs} \\
+        --hvg_select_method ${params.hvg_select_method} \\
         --outdir         .
     """
 }

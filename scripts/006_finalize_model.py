@@ -27,13 +27,15 @@ What it does:
      joblib bundle.
 
 Technical covariate regression (--meta_file / --train_only_covs /
---train_test_covs), if used, is applied once to the full dataset before HVG
-selection (there's no held-out fold here to protect — see step 2 above). Only
-the train_test_covs adjustment is persisted in the bundle (as
-bundle["covariate_model"]) for reapplication to genuinely new samples at
-scoring time — see helpers.regress_out_covariates for why train_only_covs is
-fit-and-discarded instead. bundle["train_only_covs"] records which covariates
-were used for provenance only; they are never reapplied.
+--train_test_covs), if used, is applied once to the full dataset AFTER HVG
+selection (selection always runs on raw, pre-regression values — see
+helpers._fit_outer_fold's docstring; there's no held-out fold here to protect
+either way — see step 2 above). Only the train_test_covs adjustment is
+persisted in the bundle (as bundle["covariate_model"]) for reapplication to
+genuinely new samples at scoring time — see helpers.regress_out_covariates for
+why train_only_covs is fit-and-discarded instead. bundle["train_only_covs"]
+records which covariates were used for provenance only; they are never
+reapplied.
 
 Does NOT support "mil": MIL's persistence needs a meaningfully different
 format (torch model state dict, attention weights) and is out of scope here —
@@ -69,6 +71,7 @@ from helpers import (
     load_pseudobulk,
     regress_out_covariates,
     select_hvgs,
+    select_hvgs_confound_aware,
     split_covariate_names,
     validate_covariate_lists,
     VARIANCE_WEIGHTED_R2_SCORER,
@@ -116,6 +119,15 @@ def parse_args():
                         "002_train_tree_models.py run used, if it used covariate regression.")
     p.add_argument("--train_only_covs",  nargs="*", default=[])
     p.add_argument("--train_test_covs",  nargs="*", default=[])
+    p.add_argument("--hvg_select_method", default="default",
+                   choices=["default", "sq_target_vs_technical"],
+                   help="Should match whatever the real 002_train_tree_models.py run used — "
+                        "see helpers.select_hvgs_confound_aware and temp/hvg_selection.txt. "
+                        "Uses one shared panel (against the full target matrix) here "
+                        "regardless of model, unlike 002's per-target panels for "
+                        "elasticnet_indep/lasso_indep — this script already uses one shared "
+                        "panel for every model (no fold-specific reselection at all, since "
+                        "there's no fold), so that simplification is kept for this method too.")
     p.add_argument("--outdir",           required=True)
     return p.parse_args()
 
@@ -136,6 +148,14 @@ def main():
     args = parse_args()
     args.train_only_covs = split_covariate_names(args.train_only_covs)
     args.train_test_covs = split_covariate_names(args.train_test_covs)
+    if args.hvg_select_method == "sq_target_vs_technical" and not (args.train_only_covs or args.train_test_covs):
+        raise ValueError(
+            "--hvg_select_method sq_target_vs_technical requires a non-empty "
+            "--train_only_covs or --train_test_covs (it ranks genes by target "
+            "signal relative to covariate confound exposure — scored against "
+            "--train_only_covs if given, else --train_test_covs — which is "
+            "undefined without at least one)."
+        )
 
     if args.model == "mil":
         raise ValueError(
@@ -175,7 +195,6 @@ def main():
         y       = y[keep_mask]
 
     df_meta = None
-    covariate_model = None  # (ColumnTransformer, LinearRegression) for train_test_covs, or None
     if args.train_only_covs or args.train_test_covs:
         if not args.meta_file:
             raise ValueError("--train_only_covs/--train_test_covs given but --meta_file is not set")
@@ -189,6 +208,37 @@ def main():
         samples = [samples[i] for i in keep_idx]
         y       = y[keep_idx]
 
+    print(f"X={X.shape}  y={y.shape}  label_mode={args.label_mode}")
+
+    # ── HVG selection: once, on the full RAW dataset (before any covariate
+    # regression) — no held-out fold to protect from this point on, since
+    # this fit is meant to be applied to genuinely new samples, not evaluated
+    # on any of the current ones. Selection always precedes regression (see
+    # helpers._fit_outer_fold's docstring): "sq_target_vs_technical" needs
+    # covariate_r2 computed on unadjusted values, and regressing only the
+    # selected columns afterward is cheaper than regressing every candidate
+    # gene (regression is column-independent, so this gives identical
+    # results either way). One shared panel for every model (see
+    # --hvg_select_method help), even elasticnet_indep/lasso_indep/
+    # xgboost_indep — unlike 002_train_tree_models.py's per-target panels for
+    # the former two, matching this script's existing simpler
+    # (non-fold-specific) architecture.
+    if args.hvg_select_method == "sq_target_vs_technical":
+        confound_covs = args.train_only_covs if args.train_only_covs else args.train_test_covs
+        hvg_idx_local = select_hvgs_confound_aware(
+            X[:, :n_gene_features], y, df_meta, samples, confound_covs, args.hvg_pct, args.hvg_max,
+        )
+    else:
+        hvg_idx_local = select_hvgs(X[:, :n_gene_features], args.hvg_pct, args.hvg_max)
+    abund_idx     = np.arange(n_gene_features, X.shape[1])
+    sel_idx       = np.concatenate([hvg_idx_local, abund_idx])
+    X             = X[:, sel_idx]
+    final_feature_names = [feature_names[i] for i in sel_idx]
+    print(f"  Selected {len(hvg_idx_local)} HVGs + {len(abund_idx)} abundance features "
+          f"= {X.shape[1]} final features")
+
+    covariate_model = None  # (ColumnTransformer, LinearRegression) for train_test_covs, or None
+    if args.train_only_covs or args.train_test_covs:
         print(f"  Regressing out covariates (fit on all {len(samples)} samples — no held-out "
               f"fold here): train_only_covs={args.train_only_covs}  train_test_covs={args.train_test_covs}")
         # No held-out fold in this script — every sample is "training" from
@@ -198,19 +248,6 @@ def main():
         X, _, covariate_model = regress_out_covariates(
             X, X, df_meta, samples, samples, args.train_only_covs, args.train_test_covs,
         )
-
-    print(f"X={X.shape}  y={y.shape}  label_mode={args.label_mode}")
-
-    # ── HVG selection: once, on the full dataset — no held-out fold to protect
-    # from this point on, since this fit is meant to be applied to genuinely
-    # new samples, not evaluated on any of the current ones.
-    hvg_idx_local = select_hvgs(X[:, :n_gene_features], args.hvg_pct, args.hvg_max)
-    abund_idx     = np.arange(n_gene_features, X.shape[1])
-    sel_idx       = np.concatenate([hvg_idx_local, abund_idx])
-    X             = X[:, sel_idx]
-    final_feature_names = [feature_names[i] for i in sel_idx]
-    print(f"  Selected {len(hvg_idx_local)} HVGs + {len(abund_idx)} abundance features "
-          f"= {X.shape[1]} final features")
 
     scaler   = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -260,6 +297,7 @@ def main():
             "covariate_model": covariate_model,
             "train_test_covs": args.train_test_covs,
             "train_only_covs": args.train_only_covs,
+            "hvg_select_method": args.hvg_select_method,
         }
     else:
         y_fit = y if n_targets > 1 else y.ravel()
@@ -280,6 +318,7 @@ def main():
             "covariate_model": covariate_model,
             "train_test_covs": args.train_test_covs,
             "train_only_covs": args.train_only_covs,
+            "hvg_select_method": args.hvg_select_method,
         }
 
     outpath = os.path.join(args.outdir, f"{args.cluster}_{args.model}_{args.label_mode}_final_model.joblib")
