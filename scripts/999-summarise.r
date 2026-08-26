@@ -46,7 +46,7 @@ ggplot(tile_data, aes(x = model, y = cluster, fill = r2_variance_weighted)) +
     geom_tile(color = "white", linewidth = 0.5) +
     geom_text(aes(label = sig_label), color = "red", size = 5, fontface = "bold", vjust = 0.75) +
     scale_fill_gradient(low = "white", high = "darkblue",
-                       limits = c(0, 1),
+                       limits = c(0, max(tile_data$r2_variance_weighted, na.rm = TRUE)),
                        na.value = "grey80",
                        name = "R² Variance\nWeighted") +
     theme_classic() +
@@ -64,6 +64,38 @@ ggplot(tile_data, aes(x = model, y = cluster, fill = r2_variance_weighted)) +
     coord_fixed(ratio = 1)
 
 ggsave(filename = file.path(outdir, "overall_metrics_tile_plot.png"), width = 8, height = 6)    
+
+# Create row-scaled version (scales R² within each cluster)
+tile_data_scaled = tile_data %>%
+    group_by(cluster) %>%
+    mutate(
+        r2_scaled = (r2_variance_weighted - min(r2_variance_weighted, na.rm = TRUE)) / 
+                    (max(r2_variance_weighted, na.rm = TRUE) - min(r2_variance_weighted, na.rm = TRUE))
+    ) %>%
+    ungroup()
+
+ggplot(tile_data_scaled, aes(x = model, y = cluster, fill = r2_scaled)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sig_label), color = "red", size = 5, fontface = "bold", vjust = 0.75) +
+    scale_fill_gradient(low = "white", high = "darkblue",
+                       limits = c(0, 1),
+                       na.value = "grey80",
+                       name = "R² Scaled\n(by cluster)") +
+    theme_classic() +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank(),
+        axis.title = element_text(face = "bold")
+    ) +
+    labs(
+        title = "R² Variance Weighted by Cluster and Model (Row-Scaled)",
+        subtitle = "* = all PCs p<0.05 (permutation null)   ** = all PCs p<0.01",
+        x = "Model",
+        y = "Cluster"
+    ) +
+    coord_fixed(ratio = 1)
+
+ggsave(filename = file.path(outdir, "overall_metrics_tile_plot_row_scaled.png"), width = 8, height = 6)
 
 # Save a summary table of the overall results
 sumdf = res$overall %>% 
