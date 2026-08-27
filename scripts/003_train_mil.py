@@ -47,10 +47,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import (
     HAS_TORCH,
     apply_label_mode,
+    load_meta_file,
     load_mil_bags,
     nested_cv_mil,
     overall_metrics,
     per_archetype_metrics,
+    split_covariate_names,
+    validate_covariate_lists,
 )
 
 if not HAS_TORCH:
@@ -83,11 +86,37 @@ def parse_args():
                         "restrict to samples where max weight > --min_score")
     p.add_argument("--min_score",         type=float, default=0.5,
                    help="Minimum dominant archetype weight for argmax_filtered mode")
+    p.add_argument("--meta_file",         default=None,
+                   help="Per-sample metadata CSV (first column = sample ID). Required if "
+                        "either --train_only_covs or --train_test_covs is non-empty.")
+    p.add_argument("--train_only_covs",   nargs="*", default=[],
+                   help="Covariate column(s) regressed out of training CELLS only (not "
+                        "applied to held-out cells) — see helpers.regress_out_covariates.")
+    p.add_argument("--train_test_covs",   nargs="*", default=[],
+                   help="Covariate column(s) regressed out of both training and held-out "
+                        "CELLS (fit on train, applied to test) — see helpers.regress_out_covariates.")
+    p.add_argument("--hvg_select_method", default="default",
+                   choices=["default", "sq_target_vs_technical"],
+                   help="'default': rank HVG candidates (on pseudobulked training bags) by "
+                        "raw variance. 'sq_target_vs_technical': rank by target_r2^2/covariate_r2 "
+                        "instead, scored against --train_only_covs if non-empty else "
+                        "--train_test_covs (requires at least one non-empty) — see "
+                        "helpers.select_hvgs_confound_aware.")
     return p.parse_args()
 
 
 def main():
-    args   = parse_args()
+    args = parse_args()
+    args.train_only_covs = split_covariate_names(args.train_only_covs)
+    args.train_test_covs = split_covariate_names(args.train_test_covs)
+    if args.hvg_select_method == "sq_target_vs_technical" and not (args.train_only_covs or args.train_test_covs):
+        raise ValueError(
+            "--hvg_select_method sq_target_vs_technical requires a non-empty "
+            "--train_only_covs or --train_test_covs (it ranks genes by target "
+            "signal relative to covariate confound exposure — scored against "
+            "--train_only_covs if given, else --train_test_covs — which is "
+            "undefined without at least one)."
+        )
     os.makedirs(args.outdir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -118,6 +147,21 @@ def main():
         samples = [samples[i] for i, k in enumerate(keep_mask) if k]
         y       = y[keep_mask]
 
+    df_meta = None
+    if args.train_only_covs or args.train_test_covs:
+        if not args.meta_file:
+            raise ValueError("--train_only_covs/--train_test_covs given but --meta_file is not set")
+        print(f"Loading covariate metadata from {args.meta_file}")
+        df_meta = load_meta_file(args.meta_file)
+        validate_covariate_lists(df_meta, args.train_only_covs, args.train_test_covs)
+        keep = [i for i, s in enumerate(samples) if s in df_meta.index]
+        if len(keep) < len(samples):
+            print(f"  Dropping {len(samples) - len(keep)} samples not in meta_file")
+        bags    = [bags[i]    for i in keep]
+        samples = [samples[i] for i in keep]
+        y       = y[keep]
+        print(f"  train_only_covs={args.train_only_covs}  train_test_covs={args.train_test_covs}")
+
     print(f"  {len(bags)} bags × {y.shape[1]} targets  label_mode={args.label_mode}")
 
     with open(args.mil_params) as f:
@@ -130,6 +174,9 @@ def main():
         args.max_cells_per_bag, args.seed, device,
         n_gene_features=n_gene_features, hvg_pct=args.hvg_pct, hvg_max=args.hvg_max,
         pseudobulk_agg=args.pseudobulk_agg,
+        samples=samples, covariate_df=df_meta,
+        train_only_covs=args.train_only_covs, train_test_covs=args.train_test_covs,
+        hvg_select_method=args.hvg_select_method,
     )
 
     pd.DataFrame(fold_metrics).to_csv(

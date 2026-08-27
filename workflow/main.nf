@@ -139,7 +139,15 @@ process TRAIN_TREE_MODELS {
 // params.xgboost2_env at an environment with a current XGBoost to use this.
 // Guarded by params.run_xgboost_joint (off by default) — see workflow below.
 process TRAIN_XGBOOST_JOINT {
-    label 'mem_32gb'
+    // Native multi_strategy="multi_output_tree" fits ran heavier than
+    // TRAIN_TREE_MODELS' other models on the same 32GB/12h envelope — LSF
+    // TERM_MEMLIMIT'd clusters A/B/D at 33.9-35.2GB (against a 32GB request).
+    // mem_64gb gives ample headroom (64GB, 24h, 'long' queue from the first
+    // attempt — no need to wait for a retry to get a workable time budget);
+    // cpus=8 is added via the withName override in conf/training.config to
+    // match --n_jobs_inner_xgboost below (mem_64gb itself doesn't set cpus,
+    // since MIL — its other consumer — doesn't need this many).
+    label 'mem_64gb'
     container params.xgboost2_env
     tag "xgboost_joint_${cluster}_${label_mode}"
     publishDir "${params.outdir}/tree_models/${cluster}/xgboost_joint/${label_mode}", mode: 'copy'
@@ -250,11 +258,13 @@ process TRAIN_MIL {
     input:
     tuple val(cluster), path(mil_bags), path(targets), val(label_mode)
     path mil_param_grid
+    path meta_file
 
     output:
     tuple val(cluster), path("${cluster}_${label_mode}_mil/"), emit: results
 
     script:
+    def meta_arg = meta_file.name != "NO_FILE" ? "--meta_file ${meta_file}" : ""
     """
     mkdir -p ${cluster}_${label_mode}_mil
     python ${launchDir}/scripts/003_train_mil.py \\
@@ -272,6 +282,10 @@ process TRAIN_MIL {
         --n_iter            ${params.n_hpo_iter_mil} \\
         --max_cells_per_bag ${params.max_cells_per_bag} \\
         --seed              ${params.random_seed} \\
+        ${meta_arg} \\
+        --train_only_covs   ${params.train_only_covs} \\
+        --train_test_covs   ${params.train_test_covs} \\
+        --hvg_select_method ${params.hvg_select_method} \\
         --outdir            ${cluster}_${label_mode}_mil
     """
 }
@@ -471,7 +485,7 @@ workflow {
         .combine(label_modes_ch)
     // mil_input_ch: [cluster, mil_bags, targets, label_mode]
     if (params.run_mil == "true") {
-        TRAIN_MIL(mil_input_ch, mil_params_ch)
+        TRAIN_MIL(mil_input_ch, mil_params_ch, meta_file_ch)
         mil_results_ch = TRAIN_MIL.out.results.groupTuple()
     } else {
         // Emit an empty grouped placeholder per cluster so EVALUATE_MODELS can still run

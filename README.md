@@ -186,15 +186,16 @@ Nested CV (steps 2–3) exists purely to **estimate generalization performance h
 Run it only after using nested CV — and `model_summary_overall.csv` in particular — to decide which cluster/model/label_mode combination is actually worth finalizing:
 
 ```bash
-python scripts/006_finalize_model.py \
-    --cluster B \
-    --pseudobulk results/prepared_data/B.pseudobulk.npz \
-    --targets    results/prepared_data/B.targets.csv \
-    --model      elasticnet_indep \
-    --elasticnet_params scripts/param_grids/elasticnet_params.json \
-    --hvg_pct 0.20 --hvg_max 3000 \
-    --label_mode full \
-    --outdir results/final_models
+mkdir -p logs
+MEM=30000
+for cluster in results/tree_models/*; do
+    cl=$(basename $cluster)
+    echo "-- Submitting final model for: " $cl " --"
+    bsub -J "FINAL_MODEL-${cl}" -M "$MEM" -R"select[mem>$MEM] rusage[mem=$MEM] span[hosts=1]" -G team152 -q long -n 1 \
+            -e logs/FINAL_MODEL-${cl}_%J-stderr \
+            -o logs/FINAL_MODEL-${cluster}_%J-stdout \
+    "bash run_finalize_model.sh --cluster ${cl} --model xgboost_indep"
+done
 ```
 
 HVGs are selected once (from all samples, on raw values) — via `--hvg_select_method`, same `"default"`/`"sq_target_vs_technical"` choice and covariate-list requirement as step 2, but always as **one shared panel for every model**, including `elasticnet_indep`/`lasso_indep` — unlike step 2's genuinely per-target panels for those two, this is a deliberate simplification consistent with `006`'s existing non-fold-specific design. If `train_only_covs`/`train_test_covs` are set (same `meta_file` convention as step 2), technical covariates are then regressed out once, on the full dataset, from the selected columns — there's no held-out fold here to protect either way. It then fits a `StandardScaler`, then runs plain (non-nested) `RandomizedSearchCV` — which performs hyperparameter selection via k-fold CV and refits on the full data with the winning combination in one call. The result is saved as a single `joblib` bundle (`{cluster}_{model}_{label_mode}_final_model.joblib`) containing the fitted estimator(s), scaler, exact feature names/order, and metadata (chosen hyperparameters, CV scores) — everything needed to transform and score a new sample's pseudobulk profile later. If `train_test_covs` was used, the bundle also includes `covariate_model` (the fitted `ColumnTransformer`/`LinearRegression` pair) to reapply that same adjustment to a genuinely new sample's covariates before scoring; `train_only_covs`' adjustment is fit-and-discarded and never reapplied (see step 2's covariate section), so `train_only_covs` is recorded in the bundle for provenance only.

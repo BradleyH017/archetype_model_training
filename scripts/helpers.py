@@ -1023,18 +1023,40 @@ if HAS_TORCH:
             scheduler.step()
 
     def nested_cv_mil(bags, y, hp_grid, n_outer, n_inner, n_iter, max_cells, seed, device,
-                      n_gene_features=None, hvg_pct=None, hvg_max=None, pseudobulk_agg="mean"):
+                      n_gene_features=None, hvg_pct=None, hvg_max=None, pseudobulk_agg="mean",
+                      samples=None, covariate_df=None, train_only_covs=None, train_test_covs=None,
+                      hvg_select_method="default"):
         """Nested CV for attention-based MIL with random hyperparameter search.
 
         n_gene_features, hvg_pct, hvg_max : if n_gene_features is given, HVGs
             are reselected per outer fold from that fold's training samples
             only — each training bag's cells are first pseudobulked
-            (aggregated via pseudobulk_agg), then ranked by variance across
-            those per-sample pseudobulk profiles (columns [:n_gene_features]
-            only), the same statistic used for the tree/linear models. This
+            (aggregated via pseudobulk_agg) for the SELECTION step, then
+            ranked either by raw variance ("default") or, under
+            hvg_select_method="sq_target_vs_technical", by
+            target_r2^2/covariate_r2 (select_hvgs_confound_aware, scored
+            against train_only_covs if non-empty else train_test_covs — same
+            fallback as the tree/linear models; see _fit_outer_fold). This
             avoids ranking genes using cells from samples that end up in the
             held-out test fold. Columns at/after n_gene_features (abundance
             features) are always kept as-is.
+
+        samples, covariate_df, train_only_covs, train_test_covs : if given,
+            technical covariates are ALSO regressed out of the selected
+            columns' per-cell values (not just used for ranking) — fit on
+            training CELLS only (each cell's row built from its own sample's
+            covariate values, via the same fit_covariate_design plumbing used
+            everywhere else), then applied to held-out cells exactly like
+            regress_out_covariates does for the tree/linear models:
+            train_only_covs's fitted correction is train-only and discarded;
+            train_test_covs's is fit on train and reapplied to test using
+            train-derived coefficients, never refit from test. Implemented by
+            calling regress_out_covariates directly on a per-CELL matrix (all
+            selected cells vstacked) with each cell's sample ID repeated as
+            many times as that sample contributes cells — the function itself
+            is unchanged; it only cares that row count matches the sample
+            list, so per-cell rows work exactly like per-sample rows do for
+            the tree/linear pipeline.
         """
         n_outputs = y.shape[1]
 
@@ -1056,17 +1078,55 @@ if HAS_TORCH:
             bags_te_full = [bags[i] for i in te_idx]
             y_tr, y_te = y[tr_idx], y[te_idx]
 
+            samples_tr = [samples[i] for i in tr_idx] if samples is not None else None
+            samples_te = [samples[i] for i in te_idx] if samples is not None else None
+
             if n_gene_features is not None:
                 agg_fn = np.mean if pseudobulk_agg == "mean" else np.sum
                 pb_tr  = np.array(
                     [agg_fn(b[:, :n_gene_features], axis=0) for b in bags_tr_full],
                     dtype=np.float32,
                 )
-                hvg_idx_local = select_hvgs(pb_tr, hvg_pct, hvg_max)
+                if hvg_select_method == "sq_target_vs_technical":
+                    confound_covs = train_only_covs if train_only_covs else train_test_covs
+                    hvg_idx_local = select_hvgs_confound_aware(
+                        pb_tr, y_tr, covariate_df, samples_tr, confound_covs, hvg_pct, hvg_max,
+                    )
+                else:
+                    hvg_idx_local = select_hvgs(pb_tr, hvg_pct, hvg_max)
                 abund_idx     = np.arange(n_gene_features, bags_tr_full[0].shape[1])
                 sel_idx       = np.concatenate([hvg_idx_local, abund_idx])
                 bags_tr = [b[:, sel_idx] for b in bags_tr_full]
                 bags_te = [b[:, sel_idx] for b in bags_te_full]
+
+                if covariate_df is not None and (train_only_covs or train_test_covs):
+                    # Residualize the SELECTED columns' per-cell values. Same
+                    # regress_out_covariates used everywhere else, just fed
+                    # per-CELL rows (each cell's sample ID repeated once per
+                    # cell that sample contributes) instead of per-sample rows
+                    # — it only cares that the row count matches the sample
+                    # list, so this fits/applies exactly like the tree/linear
+                    # models' train_only_covs/train_test_covs contract, just
+                    # at cell granularity: fit on training cells only, then
+                    # applied to held-out cells using train-derived
+                    # coefficients (never refit from test).
+                    cell_counts_tr = [b.shape[0] for b in bags_tr]
+                    cell_counts_te = [b.shape[0] for b in bags_te]
+                    samples_percell_tr = [s for s, n in zip(samples_tr, cell_counts_tr)
+                                          for _ in range(n)]
+                    samples_percell_te = [s for s, n in zip(samples_te, cell_counts_te)
+                                          for _ in range(n)]
+                    X_cells_tr, X_cells_te, _ = regress_out_covariates(
+                        np.vstack(bags_tr), np.vstack(bags_te), covariate_df,
+                        samples_percell_tr, samples_percell_te,
+                        train_only_covs, train_test_covs,
+                    )
+                    bags_tr, i = [], 0
+                    for n in cell_counts_tr:
+                        bags_tr.append(X_cells_tr[i:i + n]); i += n
+                    bags_te, i = [], 0
+                    for n in cell_counts_te:
+                        bags_te.append(X_cells_te[i:i + n]); i += n
             else:
                 bags_tr, bags_te = bags_tr_full, bags_te_full
 
