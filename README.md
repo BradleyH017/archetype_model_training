@@ -203,13 +203,16 @@ HVGs are selected once (from all samples, on raw values) — via `--hvg_select_m
 ---
 
 ## Running SHAP analysis for the final models (`008_shap_explain.py`)
-```
-module load HGI/softpack/users/eh19/BioAUTOMATED/1
-python scripts/008_shap_explain.py \
-    --bundle results/final_models/A_xgboost_indep_full_final_model.joblib \
-    --pseudobulk results/prepared_data/B.pseudobulk.npz \
-    --meta_file \
-    --outdir results/final_models/shap
+```bash
+module load HGI/softpack/users/bh18/XGBoost2/3
+for cluster in results/tree_models/*; do
+    cl=$(basename $cluster)
+    python scripts/008_shap_explain.py \
+        --bundle results/final_models/${cl}_xgboost_indep_full_final_model.joblib \
+        --pseudobulk results/prepared_data/${cl}.pseudobulk.npz \
+        --meta_file /lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/mrVI/results/tables/meta_df.csv \
+        --outdir results/final_models/shap
+done
 ```
 
 Supports `xgboost_indep`, `xgboost_joint`, `rf`, `elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep`. **Does not support `mil`** — MIL's persistence needs a meaningfully different format (torch model state, attention weights); passing `--model mil` raises a clear error.

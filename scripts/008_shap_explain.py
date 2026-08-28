@@ -49,6 +49,7 @@ import xgboost
 import joblib
 import numpy as np
 import pandas as pd
+sys.path.append("pip_packages")
 import shap
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
