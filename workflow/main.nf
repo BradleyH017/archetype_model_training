@@ -449,35 +449,43 @@ workflow {
     // xgboost_joint requires (see TRAIN_XGBOOST_JOINT) — wiring a second
     // container-specific permutation-null process wasn't asked for here.
     def NULL_TEST_MODELS = ['elasticnet', 'lasso', 'elasticnet_indep', 'lasso_indep', 'xgboost_indep']
-    // Up to 4 models share the same cluster key here. Nextflow's join() silently
-    // drops all but the first match when a key repeats on one side (see
-    // https://github.com/nextflow-io/nextflow/issues/654) — with 4
-    // elasticnet/lasso variants all keyed by the same cluster, join() would only
-    // ever pass through whichever model's result happened to arrive first,
-    // silently dropping the other 3. Broadcast via a cluster->value Map lookup
-    // instead (.combine() against a single-emission value channel), which can't
-    // drop anything regardless of how many models share a key.
-    pseudobulk_map_ch = pseudobulk_ch.toList().map { it.collectEntries { c, pb  -> [(c): pb] } }
-    targets_map_ch    = targets_ch.toList().map    { it.collectEntries { c, tgt -> [(c): tgt] } }
-    perm_null_input_ch = TRAIN_TREE_MODELS.out.results_tagged
-        .filter { cluster, model, label_mode, dir -> model in NULL_TEST_MODELS }
-        .combine(pseudobulk_map_ch)
-        .combine(targets_map_ch)
-        .map { cluster, model, label_mode, dir, pbMap, tgtMap ->
-            [cluster, dir, model, label_mode, pbMap[cluster], tgtMap[cluster]]
-        }
-    // perm_null_input_ch: [cluster, tree_dir, model, label_mode, pseudobulk, targets]
-    PERMUTATION_NULL(perm_null_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch, meta_file_ch)
+    if (params.run_permutation_null == "true") {
+        // Up to 4 models share the same cluster key here. Nextflow's join() silently
+        // drops all but the first match when a key repeats on one side (see
+        // https://github.com/nextflow-io/nextflow/issues/654) — with 4
+        // elasticnet/lasso variants all keyed by the same cluster, join() would only
+        // ever pass through whichever model's result happened to arrive first,
+        // silently dropping the other 3. Broadcast via a cluster->value Map lookup
+        // instead (.combine() against a single-emission value channel), which can't
+        // drop anything regardless of how many models share a key.
+        pseudobulk_map_ch = pseudobulk_ch.toList().map { it.collectEntries { c, pb  -> [(c): pb] } }
+        targets_map_ch    = targets_ch.toList().map    { it.collectEntries { c, tgt -> [(c): tgt] } }
+        perm_null_input_ch = TRAIN_TREE_MODELS.out.results_tagged
+            .filter { cluster, model, label_mode, dir -> model in NULL_TEST_MODELS }
+            .combine(pseudobulk_map_ch)
+            .combine(targets_map_ch)
+            .map { cluster, model, label_mode, dir, pbMap, tgtMap ->
+                [cluster, dir, model, label_mode, pbMap[cluster], tgtMap[cluster]]
+            }
+        // perm_null_input_ch: [cluster, tree_dir, model, label_mode, pseudobulk, targets]
+        PERMUTATION_NULL(perm_null_input_ch, xgb_params_ch, rf_params_ch, elasticnet_params_ch, lasso_params_ch, meta_file_ch)
 
-    // Only thread the summary CSV into EVALUATE_MODELS (the raw per-permutation
-    // draws stay published under results/permutation_null/ for direct inspection
-    // but don't need to flow through the eval/aggregate chain).
-    perm_null_results_ch = PERMUTATION_NULL.out.results
-        .map { cluster, summary, raw -> [cluster, summary] }
-        .groupTuple()
-    // perm_null_results_ch: [cluster, [summary_elasticnet, summary_lasso, ...]]
-    // — however many of the 4 target models actually succeeded for that cluster,
-    // not necessarily all 4.
+        // Only thread the summary CSV into EVALUATE_MODELS (the raw per-permutation
+        // draws stay published under results/permutation_null/ for direct inspection
+        // but don't need to flow through the eval/aggregate chain).
+        perm_null_results_ch = PERMUTATION_NULL.out.results
+            .map { cluster, summary, raw -> [cluster, summary] }
+            .groupTuple()
+        // perm_null_results_ch: [cluster, [summary_elasticnet, summary_lasso, ...]]
+        // — however many of the 4 target models actually succeeded for that cluster,
+        // not necessarily all 4.
+    } else {
+        // eval_input_ch's join below already uses remainder:true + `?: []`
+        // specifically to tolerate clusters with no permutation-null result at
+        // all, so Channel.empty() here (rather than a per-cluster placeholder
+        // like mil_results_ch's else-branch needs) is sufficient.
+        perm_null_results_ch = Channel.empty()
+    }
 
     // Step 2b: MIL — fan out to one job per (cluster × label_mode)
     mil_input_ch = mil_bags_ch

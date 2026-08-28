@@ -200,6 +200,18 @@ done
 
 HVGs are selected once (from all samples, on raw values) — via `--hvg_select_method`, same `"default"`/`"sq_target_vs_technical"` choice and covariate-list requirement as step 2, but always as **one shared panel for every model**, including `elasticnet_indep`/`lasso_indep` — unlike step 2's genuinely per-target panels for those two, this is a deliberate simplification consistent with `006`'s existing non-fold-specific design. If `train_only_covs`/`train_test_covs` are set (same `meta_file` convention as step 2), technical covariates are then regressed out once, on the full dataset, from the selected columns — there's no held-out fold here to protect either way. It then fits a `StandardScaler`, then runs plain (non-nested) `RandomizedSearchCV` — which performs hyperparameter selection via k-fold CV and refits on the full data with the winning combination in one call. The result is saved as a single `joblib` bundle (`{cluster}_{model}_{label_mode}_final_model.joblib`) containing the fitted estimator(s), scaler, exact feature names/order, and metadata (chosen hyperparameters, CV scores) — everything needed to transform and score a new sample's pseudobulk profile later. If `train_test_covs` was used, the bundle also includes `covariate_model` (the fitted `ColumnTransformer`/`LinearRegression` pair) to reapply that same adjustment to a genuinely new sample's covariates before scoring; `train_only_covs`' adjustment is fit-and-discarded and never reapplied (see step 2's covariate section), so `train_only_covs` is recorded in the bundle for provenance only.
 
+---
+
+## Running SHAP analysis for the final models (`008_shap_explain.py`)
+```
+module load HGI/softpack/users/eh19/BioAUTOMATED/1
+python scripts/008_shap_explain.py \
+    --bundle results/final_models/A_xgboost_indep_full_final_model.joblib \
+    --pseudobulk results/prepared_data/B.pseudobulk.npz \
+    --meta_file \
+    --outdir results/final_models/shap
+```
+
 Supports `xgboost_indep`, `xgboost_joint`, `rf`, `elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep`. **Does not support `mil`** — MIL's persistence needs a meaningfully different format (torch model state, attention weights); passing `--model mil` raises a clear error.
 
 Note: the permutation-null significance test (`007_permutation_null.py`) is a separate concern from finalizing — it runs automatically in the main pipeline for the ElasticNet/Lasso family and `xgboost_indep`, from each model's own real nested-CV fold_metrics, with no dependency on this script. See step 2a above.
