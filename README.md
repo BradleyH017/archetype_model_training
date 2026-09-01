@@ -39,6 +39,8 @@ model_training/
 │   ├── 005_aggregate.py         # Cross-cluster summary & plots
 │   ├── 006_finalize_model.py    # Manual: refit one deployable model on all data
 │   ├── 007_permutation_null.py  # Automatic: per-PC permutation null test (ElasticNet/Lasso family)
+│   ├── 008_shap_explain.py      # Manual: TreeSHAP feature attributions for a finalized model
+│   ├── 009_go_enrichment.R      # Manual: GO ORA (clusterProfiler) on 008's SHAP summaries
 │   └── param_grids/
 │       ├── xgboost_params.json
 │       ├── rf_params.json
@@ -200,6 +202,10 @@ done
 
 HVGs are selected once (from all samples, on raw values) — via `--hvg_select_method`, same `"default"`/`"sq_target_vs_technical"` choice and covariate-list requirement as step 2, but always as **one shared panel for every model**, including `elasticnet_indep`/`lasso_indep` — unlike step 2's genuinely per-target panels for those two, this is a deliberate simplification consistent with `006`'s existing non-fold-specific design. If `train_only_covs`/`train_test_covs` are set (same `meta_file` convention as step 2), technical covariates are then regressed out once, on the full dataset, from the selected columns — there's no held-out fold here to protect either way. It then fits a `StandardScaler`, then runs plain (non-nested) `RandomizedSearchCV` — which performs hyperparameter selection via k-fold CV and refits on the full data with the winning combination in one call. The result is saved as a single `joblib` bundle (`{cluster}_{model}_{label_mode}_final_model.joblib`) containing the fitted estimator(s), scaler, exact feature names/order, and metadata (chosen hyperparameters, CV scores) — everything needed to transform and score a new sample's pseudobulk profile later. If `train_test_covs` was used, the bundle also includes `covariate_model` (the fitted `ColumnTransformer`/`LinearRegression` pair) to reapply that same adjustment to a genuinely new sample's covariates before scoring; `train_only_covs`' adjustment is fit-and-discarded and never reapplied (see step 2's covariate section), so `train_only_covs` is recorded in the bundle for provenance only.
 
+Supports `xgboost_indep`, `xgboost_joint`, `rf`, `elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep`. **Does not support `mil`** — MIL's persistence needs a meaningfully different format (torch model state, attention weights); passing `--model mil` raises a clear error.
+
+Note: the permutation-null significance test (`007_permutation_null.py`) is a separate concern from finalizing — it runs automatically in the main pipeline for the ElasticNet/Lasso family and `xgboost_indep`, from each model's own real nested-CV fold_metrics, with no dependency on this script. See step 2a above.
+
 ---
 
 ## Running SHAP analysis for the final models (`008_shap_explain.py`)
@@ -214,10 +220,24 @@ for cluster in results/tree_models/*; do
         --outdir results/final_models/shap
 done
 ```
+Only meaningful for `xgboost_indep`/`rf` bundles (TreeSHAP-eligible — see the script's module docstring for why `xgboost_joint` and the linear models are excluded). For each bundle, writes the full per-sample signed SHAP matrices (`.npz`), an unsigned `mean(|SHAP|)`-per-gene summary (`*_shap_summary.csv`), a signed `mean(SHAP)`-per-gene summary (`*_shap_summary_signed.csv`), and the cluster's prevalence-filtered gene universe (`{cluster}_gene_universe.txt`) — the three inputs `009_go_enrichment.R` below consumes.
 
-Supports `xgboost_indep`, `xgboost_joint`, `rf`, `elasticnet`, `lasso`, `elasticnet_indep`, `lasso_indep`. **Does not support `mil`** — MIL's persistence needs a meaningfully different format (torch model state, attention weights); passing `--model mil` raises a clear error.
-
-Note: the permutation-null significance test (`007_permutation_null.py`) is a separate concern from finalizing — it runs automatically in the main pipeline for the ElasticNet/Lasso family and `xgboost_indep`, from each model's own real nested-CV fold_metrics, with no dependency on this script. See step 2a above.
+## GO over-representation test using SHAP values (`009_go_enrichment.R`)
+```bash
+module load HGI/softpack/groups/team152/UC_multiomics/3
+for cluster in results/tree_models/*; do
+    cl=$(basename $cluster)
+    Rscript scripts/009_go_enrichment.R \
+        --shap_summary results/final_models/shap/${cl}_xgboost_indep_full_shap_summary.csv \
+        --shap_summary_signed results/final_models/shap/${cl}_xgboost_indep_full_shap_summary_signed.csv \
+        --gene_universe results/final_models/shap/${cl}_gene_universe.txt \
+        --cluster ${cl} \
+        --ont "ALL" \
+        --qvalue_cutoff 0.1 \
+        --outdir results/final_models/go_enrichment
+done
+```
+Runs `clusterProfiler::enrichGO()` (GO ORA against `org.Hs.eg.db`, `SYMBOL` keytype) per archetype, in two variants: **signed** (hits = genes with `mean(SHAP) > 0`, from `--shap_summary_signed`) and **unsigned** (hits = genes with `mean(|SHAP|) > 0`, i.e. any nonzero attribution regardless of direction, from `--shap_summary`). ORA rather than ranked GSEA — unlike `../../sc_nf_diffexpression/bin/015-run_fgsea.R`'s ranked `fgsea` test, which this otherwise broadly follows for GO-category conventions — because SHAP values have many exact zeros, which would make a ranked ordering degenerate for the tied block. The universe (`--gene_universe`) is the cluster's full prevalence-filtered candidate gene set, deliberately **not** restricted to the HVG panel the model was fit on: HVG selection here (`sq_target_vs_technical`) is itself target-informed, so treating "not HVG-selected" as "outside the universe" would compound two target-informed filters into one enrichment number. `--ont` (`BP`/`CC`/`MF`/`ALL`, default `BP`), `--pvalue_cutoff` (default `0.05`), and `--qvalue_cutoff` (default `0.2`) are passed straight through to `enrichGO()`. Writes one combined `{cluster}_go_enrichment.tsv` per cluster, row-binding every archetype × sign result with added `cluster`/`archetype`/`sign` columns.
 
 ---
 
