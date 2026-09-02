@@ -23,12 +23,21 @@ to run on any other model name.
 IMPORTANT — what "SHAP value" actually means here: for each archetype
 target, SHAP produces ONE SIGNED VALUE PER SAMPLE PER GENE — a full
 (n_samples x n_features) attribution matrix, not a single global number per
-gene. This script saves that full matrix (one per target, in the .npz) AND a
+gene. This script saves that full matrix (one per target, in the .npz), a
 mean(|SHAP|)-per-gene summary table shaped like {model}_feature_importances.csv
-for quick comparison against the model's own gain-based importances — but
+for quick comparison against the model's own gain-based importances, and a
+SIGNED mean(SHAP)-per-gene summary (mean(|SHAP|) with the abs() removed is
+NOT the same thing -- it collapses direction away by construction) -- but
 the per-sample matrix is the richer artifact. Keep it if you want beeswarm/
 dependence plots, or to check whether a gene's effect direction differs
-across sample subgroups, which the single summary number can't tell you.
+across sample subgroups, which neither summary number can tell you.
+
+Also writes {cluster}_gene_universe.txt: the full prevalence-filtered
+candidate gene set for this cluster (NOT restricted to the HVG panel the
+model was fit on) -- the GO over-representation universe for
+009_go_enrichment.R, which also consumes both summary CSVs above (signed
+mean(SHAP) > 0 for its signed test; unsigned mean(|SHAP|) > 0 for its
+unsigned one).
 
 Usage:
     python scripts/008_shap_explain.py \\
@@ -77,8 +86,20 @@ def build_input_matrix(bundle, pseudobulk_path, meta_file):
     reorder to bundle['feature_names'], reapply bundle['covariate_model'] if
     present (never refit — reuses the exact fitted correction 006 already
     computed, same as scoring a genuinely new sample would), then
-    bundle['scaler'].transform()."""
-    X, samples, features, _ = load_pseudobulk(pseudobulk_path)
+    bundle['scaler'].transform().
+
+    Also returns features/n_gene_features from this same load_pseudobulk call
+    (not just the HVG-restricted subset) -- features[:n_gene_features] is the
+    prevalence-filtered candidate gene set for this cluster, used as the GO
+    over-representation universe in 009_go_enrichment.R. Deliberately NOT
+    restricted to bundle['feature_names'] (the HVG panel): HVG selection here
+    is itself target-informed (sq_target_vs_technical), not a neutral
+    detection filter, so treating "not HVG-selected" as "outside the
+    universe" would compound two target-informed filtering steps into one
+    enrichment number and throw away real signal from genes the panel cap
+    excluded.
+    """
+    X, samples, features, n_gene_features = load_pseudobulk(pseudobulk_path)
     feature_idx = {f: i for i, f in enumerate(features)}
     missing = [f for f in bundle["feature_names"] if f not in feature_idx]
     if missing:
@@ -95,7 +116,7 @@ def build_input_matrix(bundle, pseudobulk_path, meta_file):
         design = transform_covariate_design(df_meta, samples, bundle["train_test_covs"], ct)
         X = X - design @ reg.coef_.T
     X_scaled = bundle["scaler"].transform(X)
-    return X_scaled, samples
+    return X_scaled, samples, features, n_gene_features
 
 
 def explain_indep(bundle, X_scaled):
@@ -151,7 +172,8 @@ def main():
 
     print(f"Loading bundle: cluster={bundle['cluster']}  model={model_name}  "
           f"label_mode={bundle['label_mode']}")
-    X_scaled, samples = build_input_matrix(bundle, args.pseudobulk, args.meta_file)
+    X_scaled, samples, features, n_gene_features = build_input_matrix(
+        bundle, args.pseudobulk, args.meta_file)
     print(f"Input matrix: {X_scaled.shape}  ({len(bundle['feature_names'])} features, "
           f"{len(samples)} samples)")
 
@@ -181,6 +203,32 @@ def main():
     csv_path = os.path.join(args.outdir, f"{prefix}_shap_summary.csv")
     summary.to_csv(csv_path, index=False)
     print(f"Saved mean(|SHAP|)-per-gene summary to {csv_path}")
+
+    # Signed mean(SHAP) per gene per archetype -- NOT the same thing as the
+    # unsigned summary above with the abs() removed: mean(|SHAP|) collapses
+    # direction away by construction (a gene with +5/-5 across two samples
+    # and a gene with +5/+5 both average to |SHAP|=5, but only the second is
+    # "positive on net"). Needed for a directional hit criterion
+    # (SHAP > 0) -- see 009_go_enrichment.R, which uses this for its signed
+    # GO test and the unsigned summary above (mean(|SHAP|) > 0, i.e.
+    # "nonzero regardless of direction") for its unsigned one.
+    summary_signed = pd.DataFrame({"feature": bundle["feature_names"]})
+    for target, arr in shap_by_target.items():
+        summary_signed[target] = arr.mean(axis=0)
+    csv_signed_path = os.path.join(args.outdir, f"{prefix}_shap_summary_signed.csv")
+    summary_signed.to_csv(csv_signed_path, index=False)
+    print(f"Saved mean(SHAP)-per-gene (signed) summary to {csv_signed_path}")
+
+    # GO over-representation universe (009_go_enrichment.R): the full
+    # prevalence-filtered candidate gene set for this cluster, not just the
+    # HVG panel bundle['feature_names'] the model was actually fit on -- see
+    # build_input_matrix's docstring for why. One file per cluster
+    # (independent of which model got explained), safely overwritten
+    # identically if 008 is re-run for a different model on the same cluster.
+    universe_path = os.path.join(args.outdir, f"{bundle['cluster']}_gene_universe.txt")
+    with open(universe_path, "w") as f:
+        f.write("\n".join(features[:n_gene_features]))
+    print(f"Saved prevalence-filtered gene universe ({n_gene_features} genes) to {universe_path}")
 
     print("\nTop 10 genes by mean(|SHAP|), per archetype:")
     for target in bundle["target_names"]:
