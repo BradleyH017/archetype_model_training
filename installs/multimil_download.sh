@@ -34,8 +34,9 @@
 #   to you.)
 set -euo pipefail
 
-PYTHON_BIN="${/software/hgi/softpack/installs/users/sb84/bayesian_inference/1-scripts/python}"
-
+# Falls back to bare `python` (whatever's on PATH) if not overridden -- set
+# PYTHON_BIN explicitly if that's not the right 3.12 interpreter for you.
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 # Hard requirement, not a suggestion -- see the module comment above for why
 # MultiMIL has never had a release compatible with an older Python.
@@ -48,37 +49,11 @@ if sys.version_info < (3, 12):
 TARGET_DIR="multimil_packages_1.0.0"
 mkdir -p "$TARGET_DIR"
 
-# Exported now (not just documented at the end) so that if pip itself needs
-# bootstrapping below, the bootstrapped copy is immediately importable too --
-# see that block for why plain `ensurepip --user` isn't used here. Required
-# for every `-m pip` call below to work at all: pip under --target is a
-# plain importable package (multimil_packages_1.0.0/pip/), not a script, so
-# it only resolves via `python -m pip` once its directory is on PYTHONPATH --
-# there is no standalone `pip` executable to run directly here.
-
-if ! python -m pip --version >/dev/null 2>&1; then
-    # `ensurepip --user` installs into $HOME/.local -- deliberately not used:
-    # this Python (e.g. a Spack/conda-audited build) may also not add
-    # $HOME/.local to its user-site path at all, which is exactly what
-    # happened here (pip installed successfully but was then still reported
-    # as "No module named pip" on the very next invocation). get-pip.py
-    # --target instead installs pip as a plain package directly into
-    # TARGET_DIR, the same place -- and same mechanism -- every other
-    # package in this script lands, entirely independent of $HOME.
-    echo "No pip module for this Python -- bootstrapping into ${TARGET_DIR} (not \$HOME) via get-pip.py"
-    curl -sSL https://bootstrap.pypa.io/get-pip.py -o "${TARGET_DIR}/get-pip.py"
-    python "${TARGET_DIR}/get-pip.py" --target="$TARGET_DIR" --no-warn-script-location
-    rm -f "${TARGET_DIR}/get-pip.py"
-fi
-
-# Not --no-deps: unlike shap, multimil genuinely needs its full dependency
-# tree (anndata, scvi-tools, lightning/pytorch_lightning, mudata, etc. --
-# none of which this pipeline's containers already provide, unlike
-# numpy/pandas/scikit-learn), so pip resolves and pulls all of that in one
-# go -- confirmed to install successfully end-to-end except for the zarr
-# issue fixed below.
 MULTIMIL_VERSION="1.0.0"
-pip install --target="$TARGET_DIR" "multimil==${MULTIMIL_VERSION}"
+TORCH_VERSION="2.6.0+cu124"
+pip install --target="$TARGET_DIR" \
+    --extra-index-url https://download.pytorch.org/whl/cu124 \
+    "torch==${TORCH_VERSION}" "multimil==${MULTIMIL_VERSION}"
 
 # The one broken transitive dependency: force it back down to the last 2.x
 # release, which is the API (`zarr.core.Array`) anndata's own zarr-io compat
@@ -86,25 +61,73 @@ pip install --target="$TARGET_DIR" "multimil==${MULTIMIL_VERSION}"
 # --no-deps + --force-reinstall here so this one downgrade doesn't also drag
 # anndata/scvi-tools back to older versions to "satisfy" zarr<3 -- none of
 # them actually require zarr>=3, that upper bound just wasn't set anywhere
-# in this tree.
+# in this tree. Safe as a separate force-reinstall pass (unlike torch above):
+# zarr is plain Python with no same-purpose sibling packages under a
+# different name, so there's nothing for a second pass to leave orphaned.
 #"$PYTHON_BIN" -m pip install --target="$TARGET_DIR" --no-deps --force-reinstall "zarr<3"
 
-# A second broken transitive dependency, this time GPU-relevant: multimil's
-# resolution pulls the newest default torch, and torch's default (plain
-# PyPI, no --index-url) wheel now bundles CUDA 13.0 (confirmed from its own
-# requires_dist: `cuda-toolkit==13.0.3`), which needs a driver much newer
-# than most clusters have -- confirmed by direct
-# "NVIDIA driver on your system is too old (found version 12040)" error, not
-# guessed. Force-installed here from PyTorch's own cu124 wheel index instead
-# -- 2.6.0 is the newest version that index still builds for cu124, and it
-# satisfies every already-installed package that depends on torch here
-# (lightning==2.6.6 needs >=2.1.0,<4.0; pytorch_lightning==2.6.6 needs
-# >=2.1.0; scvi-tools==1.5.1 is unconstrained). Deliberately NOT --no-deps,
-# unlike the zarr fix above: torch's matching nvidia-*-cu12 shared libraries
-# (cublas/cudnn/nccl/etc.) have to be pulled alongside it from the same
-# index, not left as whatever cu13 copies the default resolution grabbed.
-pip install --target="$TARGET_DIR" --force-reinstall \
-    --index-url https://download.pytorch.org/whl/cu124 "torch==2.6.0"
+# A real bug in multimil==1.0.0 itself (confirmed still present on the
+# unreleased `main` branch too, so no newer release fixes it -- can't just
+# bump the version pin above): create_df() in multimil/utils/_utils.py
+# mutates its `pred` dict argument in place -- `pred[key] = np.atleast_1d(
+# torch.cat(pred[key])...)` for every key, all at once. get_model_output()
+# in multimil/model/_mil.py then calls save_predictions_in_adata() (which
+# calls create_df()) once PER target of a given covariate type
+# (classification / ordinal_regression / regression), but passes the SAME
+# bag_true dict every time rather than a fresh copy per target. So
+# processing the first target converts every OTHER target's still-list-of-
+# tensors entry to a numpy array too, as a side effect -- and the second
+# target's own create_df() call then does torch.cat() on an already-numpy
+# value, crashing with "TypeError: cat(): argument 'tensors' (position 1)
+# must be tuple of Tensors, not numpy.ndarray". Confirmed by direct
+# traceback, reproducible with any model that registers 2+ targets of the
+# same type -- which is presumably why upstream's own tutorials (one target
+# each) never hit it, but this pipeline's 3 archetype regression targets
+# (B1/B2/B3_clr_pca) do, on the second target processed.
+#
+# Patched here (not just once by hand in a running checkout) so a fresh
+# `rm -rf multimil_packages_1.0.0` + rerun doesn't silently lose the fix and
+# reintroduce the crash: copying the dict before mutating it means
+# converting one target's entries never touches the entries belonging to a
+# target get_model_output() hasn't processed yet. Idempotent (skips if
+# already patched, e.g. from a hand-edit) and fails loudly rather than
+# silently no-op-ing if upstream's source no longer matches what's expected
+# here, so a future multimil release changing this code gets noticed rather
+# than silently left unpatched.
+UTILS_FILE="${TARGET_DIR}/multimil/utils/_utils.py"
+"$PYTHON_BIN" - "$UTILS_FILE" <<'PATCH_EOF'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+if "pred = dict(pred)" in src:
+    print(f"{path}: create_df() dict-mutation patch already applied -- skipping")
+    sys.exit(0)
+
+old = "    if isinstance(pred, dict):\n        for key in pred.keys():\n"
+if old not in src:
+    sys.exit(
+        f"Could not find the expected unpatched create_df() code in {path} -- "
+        "multimil's source has changed since this patch was written; check "
+        "installs/multimil_download.sh and whether this bug is still present."
+    )
+
+new = (
+    "    if isinstance(pred, dict):\n"
+    "        # Upstream bug patch -- see installs/multimil_download.sh for\n"
+    "        # the full explanation. Copy the dict before mutating it:\n"
+    "        # get_model_output() reuses this SAME dict across every target\n"
+    "        # of a covariate type instead of passing a fresh copy per\n"
+    "        # target, so mutating pred[key] in place here would silently\n"
+    "        # corrupt the still-list-of-tensors entries of targets not yet\n"
+    "        # processed.\n"
+    "        pred = dict(pred)\n"
+    "        for key in pred.keys():\n"
+)
+open(path, "w").write(src.replace(old, new, 1))
+print(f"Patched {path} (create_df dict-mutation bug)")
+PATCH_EOF
 
 echo
 echo "Installed multimil==${MULTIMIL_VERSION} (+ deps, zarr pinned <3) into ${TARGET_DIR}/"

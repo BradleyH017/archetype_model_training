@@ -290,6 +290,93 @@ process TRAIN_MIL {
     """
 }
 
+// ─── 2c. MultiMIL — one Nextflow task PER OUTER FOLD ─────────────────────────
+// Deliberately different from TRAIN_TREE_MODELS/TRAIN_MIL, which each loop
+// over every outer fold inside one process: MultiMIL training is GPU-bound
+// and heavy enough per fold that each fold gets its own task/GPU allocation
+// instead of serializing 5 folds on one GPU. Fanned out over
+// cluster x target_mode(joint|indep) x fold_idx. See
+// scripts/003b_train_multimil.py's module docstring for the fold/HVG-panel
+// comparability argument with TRAIN_TREE_MODELS/TRAIN_MIL.
+process TRAIN_MULTIMIL {
+    label 'gpu_multimil'
+    container params.multimil_env
+    tag "${cluster}_${target_mode}_fold${fold_idx}"
+    publishDir "${params.outdir}/multimil/${cluster}/${target_mode}", mode: 'copy'
+
+    input:
+    tuple val(cluster), path(mil_bags), path(targets), val(target_mode), val(fold_idx)
+    path meta_file
+
+    output:
+    tuple val(cluster), val(target_mode), path("*_fold${fold_idx}_oof_predictions.csv"), emit: fold_oof
+
+    script:
+    def meta_arg = meta_file.name != "NO_FILE" ? "--meta_file ${meta_file}" : ""
+    """
+    export MULTIMIL_PKG_DIR="${launchDir}/multimil_packages_1.0.0"
+    # Defensive: multimil_packages_1.0.0 is read-only from inside this
+    # container, and numba (used by scvi-tools/anndata's own optional
+    # accelerated code paths, not just scanpy) hard-fails rather than
+    # falling back gracefully when it can't write its on-disk compile
+    # cache next to a JIT'd function's source file -- confirmed by direct
+    # traceback once already (scanpy's own numba usage, since removed from
+    # 003b_train_multimil.py, but this task's own work dir is always
+    # writable, so pointing both caches there costs nothing either way).
+    export NUMBA_CACHE_DIR="\$PWD"
+    export MPLCONFIGDIR="\$PWD"
+    python -u ${launchDir}/scripts/003b_train_multimil.py \\
+        --cluster           ${cluster} \\
+        --mil_bags          ${mil_bags} \\
+        --targets           ${targets} \\
+        --sample_col        "${params.sample_col}" \\
+        --fold_idx          ${fold_idx} \\
+        --n_outer_folds     ${params.n_outer_folds} \\
+        --target_mode       ${target_mode} \\
+        --hvg_pct           ${params.hvg_pct} \\
+        --hvg_max           ${params.hvg_max} \\
+        --hvg_select_method ${params.hvg_select_method} \\
+        --pseudobulk_agg    "${params.pseudobulk_agg}" \\
+        --max_cells_per_bag ${params.max_cells_per_bag} \\
+        --seed              ${params.random_seed} \\
+        ${meta_arg} \\
+        --train_only_covs   ${params.train_only_covs} \\
+        --train_test_covs   ${params.train_test_covs} \\
+        --outdir            .
+    """
+}
+
+// ─── 2c-combine. Stitch MultiMIL's per-fold OOF predictions back together ───
+// One task per (cluster x target_mode), gathering that combination's 5
+// TRAIN_MULTIMIL fold outputs. Produces the exact {model}_summary_metrics.csv/
+// {model}_overall_metrics.csv schema TRAIN_TREE_MODELS/TRAIN_MIL already use
+// (model name = "multimil_joint"/"multimil_indep"), so EVALUATE_MODELS below
+// needs no changes at all — its --tree_dirs is already a generic glob over
+// any directory for *_summary_metrics.csv.
+process COMBINE_MULTIMIL_FOLDS {
+    label 'mem_8gb'
+    container params.container_ml
+    tag "${cluster}_${target_mode}"
+    publishDir "${params.outdir}/multimil_combined/${cluster}/${target_mode}", mode: 'copy'
+
+    input:
+    tuple val(cluster), val(target_mode), path(fold_oof_csvs), path(targets)
+
+    output:
+    tuple val(cluster), path("${cluster}_multimil_${target_mode}/"), emit: results
+
+    script:
+    """
+    mkdir -p ${cluster}_multimil_${target_mode}
+    python ${launchDir}/scripts/003c_combine_multimil_folds.py \\
+        --cluster ${cluster} \\
+        --target_mode ${target_mode} \\
+        --fold_oof_predictions ${fold_oof_csvs} \\
+        --targets ${targets} \\
+        --outdir ${cluster}_multimil_${target_mode}
+    """
+}
+
 // ─── 3. Per-cluster evaluation: compare all models ───────────────────────────
 process EVALUATE_MODELS {
     label 'mem_8gb'
@@ -433,6 +520,12 @@ workflow {
     tree_results_ch = all_tree_results_ch.groupTuple()
     // tree_results_ch: [cluster, [dir_xgboost_indep_full, ..., dir_rf_full, dir_xgboost_joint_full (if enabled)]]
 
+    // Cluster->targets broadcast Map (see the permutation-null block below
+    // for why a Map-lookup is used instead of a plain join) — built here,
+    // unconditionally, since both the permutation-null block and the
+    // MultiMIL block need it.
+    targets_map_ch = targets_ch.toList().map { it.collectEntries { c, tgt -> [(c): tgt] } }
+
     // Step 2a-null: per-PC permutation null test — fixes hyperparameters from
     // each job's own {model}_fold_metrics.csv (no new search), so it's cheap
     // enough to run automatically for every one of these models/clusters
@@ -459,7 +552,6 @@ workflow {
         // instead (.combine() against a single-emission value channel), which can't
         // drop anything regardless of how many models share a key.
         pseudobulk_map_ch = pseudobulk_ch.toList().map { it.collectEntries { c, pb  -> [(c): pb] } }
-        targets_map_ch    = targets_ch.toList().map    { it.collectEntries { c, tgt -> [(c): tgt] } }
         perm_null_input_ch = TRAIN_TREE_MODELS.out.results_tagged
             .filter { cluster, model, label_mode, dir -> model in NULL_TEST_MODELS }
             .combine(pseudobulk_map_ch)
@@ -502,6 +594,45 @@ workflow {
             .groupTuple()
     }
     // mil_results_ch: [cluster, [mil_dir_full, mil_dir_argmax, mil_dir_argmax_filtered]]
+
+    // Step 2c: MultiMIL — fan out to one job per (cluster × target_mode × fold_idx)
+    def multimil_modes = []
+    if (params.run_multiMIL_joint == "true") multimil_modes << "joint"
+    if (params.run_multiMIL_indep == "true") multimil_modes << "indep"
+    if (multimil_modes) {
+        multimil_modes_ch = Channel.fromList(multimil_modes)
+        fold_idx_ch        = Channel.of(0..(params.n_outer_folds - 1))
+        multimil_input_ch  = mil_bags_ch
+            .join(targets_ch)
+            .combine(multimil_modes_ch)
+            .combine(fold_idx_ch)
+        // multimil_input_ch: [cluster, mil_bags, targets, target_mode, fold_idx]
+        TRAIN_MULTIMIL(multimil_input_ch, meta_file_ch)
+
+        // Broadcast targets by cluster (same Map-lookup trick as the
+        // permutation-null join above) rather than a plain join, since
+        // grouping by (cluster, target_mode) still leaves a many-cluster
+        // key on one side that a plain join could handle wrong.
+        multimil_fold_grouped_ch = TRAIN_MULTIMIL.out.fold_oof
+            .groupTuple(by: [0, 1])
+            .combine(targets_map_ch)
+            .map { cluster, target_mode, fold_csvs, tgtMap ->
+                [cluster, target_mode, fold_csvs, tgtMap[cluster]]
+            }
+        // multimil_fold_grouped_ch: [cluster, target_mode, [fold0_oof, ..., fold4_oof], targets]
+        COMBINE_MULTIMIL_FOLDS(multimil_fold_grouped_ch)
+
+        multimil_results_ch = COMBINE_MULTIMIL_FOLDS.out.results.groupTuple()
+        // multimil_results_ch: [cluster, [multimil_joint_dir, multimil_indep_dir]] (however many ran)
+
+        // Fold MultiMIL's combined result dirs into the SAME list already
+        // used as EVALUATE_MODELS' --tree_dirs, rather than adding a new
+        // input to 004_evaluate.py — it already glob-scans any directory
+        // it's given for *_summary_metrics.csv.
+        tree_results_ch = tree_results_ch
+            .join(multimil_results_ch, remainder: true)
+            .map { cluster, treeDirs, mmDirs -> [cluster, treeDirs + (mmDirs ?: [])] }
+    }
 
     // Step 3: Evaluate — join tree + MIL results + targets + permutation-null by cluster.
     // The permutation-null join uses remainder:true so a cluster is never dropped

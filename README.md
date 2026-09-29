@@ -213,10 +213,11 @@ Note: the permutation-null significance test (`007_permutation_null.py`) is a se
 module load HGI/softpack/users/bh18/XGBoost2/3
 for cluster in results/tree_models/*; do
     cl=$(basename $cluster)
+    echo "--- Computing SHAP for ${cl} ---"
     python scripts/008_shap_explain.py \
         --bundle results/final_models/${cl}_xgboost_indep_full_final_model.joblib \
         --pseudobulk results/prepared_data/${cl}.pseudobulk.npz \
-        --meta_file /lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/mrVI/results/tables/meta_df.csv \
+        --meta_file ../mrVI/results/tables/meta_df.csv \
         --outdir results/final_models/shap
 done
 ```
@@ -227,6 +228,7 @@ Only meaningful for `xgboost_indep`/`rf` bundles (TreeSHAP-eligible — see the 
 module load HGI/softpack/groups/team152/UC_multiomics/3
 for cluster in results/tree_models/*; do
     cl=$(basename $cluster)
+    echo "--- Testing GO enrichment for ${cl} ---"
     Rscript scripts/009_go_enrichment.R \
         --shap_summary results/final_models/shap/${cl}_xgboost_indep_full_shap_summary.csv \
         --shap_summary_signed results/final_models/shap/${cl}_xgboost_indep_full_shap_summary_signed.csv \
@@ -274,3 +276,17 @@ Runs `clusterProfiler::enrichGO()` (GO ORA against `org.Hs.eg.db`, `SYMBOL` keyt
 ## Dependencies
 
 Tree models require `scikit-learn`, `xgboost`, and `anndata`/`scanpy`. MIL training additionally requires `torch`. The Nextflow pipeline pulls the appropriate Singularity containers automatically on the Sanger cluster — except `xgboost_joint`, which needs XGBoost≥2.0 and runs in whatever container/environment you point `xgboost2_env` at, separately from `container_ml`.
+
+
+## MultiMIL
+### Following https://github.com/theislab/multimil
+```bash
+module load HGI/softpack/users/sb84/bayesian_inference/1
+bash installs/multimil_download.sh
+```
+Installs `multimil` (+ its full dependency tree — `anndata`, `scvi-tools`, `lightning`/`pytorch_lightning`, etc., none of which this pipeline's containers already provide) into `pip_packages/`, then force-pins `zarr<3`. That pin matters: a plain unpinned `pip install multimil` resolves `zarr`'s newest 3.x release as a transitive dependency of `anndata`, and `zarr` 3.x is a structural rewrite — its own code uses Python's `type X = ...` alias syntax (PEP 695, needs Python 3.12+) and dropped the `zarr.core.Array` path `anndata`'s zarr-io compat layer imports — so it fails with a `SyntaxError` on this pipeline's older-Python containers, and would still be the wrong API even on a newer one. See the script's own comments for the full diagnosis.
+
+Run it with the **same** `python3` you'll later run MultiMIL with (i.e. inside the same Singularity container), and when using it, **prepend** `pip_packages` to `PYTHONPATH` (don't append) so the versions installed here are used consistently rather than mixing with whatever `anndata`/`scvi-tools` the container may already ship:
+```bash
+PYTHONPATH="pip_packages:${PYTHONPATH:-}" python3 -c "import multimil"
+```
